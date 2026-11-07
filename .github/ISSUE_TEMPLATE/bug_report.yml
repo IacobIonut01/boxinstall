@@ -1,0 +1,108 @@
+name: Bug report
+description: Report a crash, failed install, broken launcher, or other problem
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Please include enough detail to reproduce it.
+        Redact passwords, tokens, usernames, and any private paths from logs.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the actual behavior and the error you saw.
+      placeholder: "I double-clicked app.rpm and boxinstall said..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      placeholder: "The details review should appear and Chrome should install."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Download ...
+        2. Double-click ...
+        3. Click ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - RPM install
+        - DEB install
+        - AppImage install
+        - Flatpak install
+        - Package review / Dependencies dialog
+        - Duplicate detection / reinstall
+        - Desktop launcher / Desktop Icons NG
+        - Manage Installed Apps (GUI)
+        - list / show / update / remove / launch (CLI/CI)
+        - Queue / concurrent runs
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: boxinstall-version
+    attributes:
+      label: boxinstall version
+      description: Paste the output of `boxinstall --version`.
+      placeholder: "1.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: Bazzite / Fedora image
+      description: Paste the relevant line from `rpm-ostree status --booted` or `/etc/os-release`.
+      placeholder: "Bazzite 44.20261012.0 (Silverblue)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: interface
+    attributes:
+      label: Interface
+      options:
+        - GUI (double-click / app grid)
+        - Terminal
+        - CI / non-interactive
+        - Manage Installed Apps
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant lines from `~/.local/state/boxinstall/boxinstall.log`.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and releases.
+          required: true
+        - label: I am running the latest release (or explained why not).
+          required: true
+        - label: I removed secrets and personal data from logs.
+          required: true

@@ -3,6 +3,8 @@
 [![CI](https://github.com/IacobIonut01/boxinstall/actions/workflows/ci.yml/badge.svg)](https://github.com/IacobIonut01/boxinstall/actions/workflows/ci.yml)
 [![Release](https://github.com/IacobIonut01/boxinstall/actions/workflows/release.yml/badge.svg)](https://github.com/IacobIonut01/boxinstall/actions/workflows/release.yml)
 
+> **AI-assisted disclaimer:** this project is developed with the assistance of AI coding tools. AI-generated changes are reviewed and tested and must pass CI, but mistakes are still possible. Review the scripts before running them and please report issues using the templates.
+
 A one-click installer for Linux packages on **Bazzite / Fedora Atomic (Silverblue, Kinoite, …)**.
 
 Double-click an `.rpm`, `.deb`, `.AppImage`, `.flatpakref`, or `.flatpak` file and it:
@@ -126,6 +128,52 @@ BOXINSTALL_YES=1 boxinstall --no-gui --no-wait ~/Downloads/app.deb
 - proceed with install/reinstall/upgrade automatically.
 
 Combine it with `--no-gui` in CI. The default lock behavior queues behind another run; use `--no-wait` for fail-fast jobs or `--wait SECONDS` / `BOXINSTALL_LOCK_TIMEOUT` to bound the wait.
+
+## Managing installed apps
+
+Open **Manage Installed Apps** from the app grid, or run:
+
+```bash
+boxinstall manage
+```
+
+The manager discovers:
+
+- apps exported from your distroboxes (RPM/DEB packages),
+- AppImages in `~/AppImages/`,
+- Flatpaks installed on the system.
+
+For each app it shows the name, version, type, container, and size. Actions are:
+
+- **Details** – package/container/desktop paths and size;
+- **Launch** – start the app;
+- **Update / Reinstall** – `dnf upgrade`, `apt-get --only-upgrade`, or `flatpak update`; AppImages open a file picker for a replacement;
+- **Remove** – uninstall the package/Flatpak/AppImage and clean up its desktop launcher.
+
+The same operations are available non-interactively for CI:
+
+```bash
+boxinstall list                     # human-readable table
+boxinstall list --json              # machine-readable inventory
+boxinstall list --tsv               # tab-separated
+boxinstall show rpm:fedora:google-chrome-stable
+boxinstall update --all
+boxinstall update flatpak:org.gnome.Calculator
+boxinstall remove -y appimage:example
+boxinstall launch rpm:fedora:google-chrome-stable
+```
+
+IDs have the form `rpm:CONTAINER:PACKAGE`, `deb:CONTAINER:PACKAGE`, `flatpak:APP_ID`, `appimage:SLUG`, or `export:CONTAINER:DESKTOP`. `list` prints them, and `show`/`update`/`remove`/`launch` accept either an ID or an app name.
+
+`remove` requires `-y` in non-interactive runs. Updates and removals use the same waiting queue as installs, so a manager action will wait for an active install to finish rather than race it.
+
+CI example:
+
+```bash
+boxinstall list --json > inventory.json
+boxinstall update --all -y
+boxinstall remove -y "$APP_ID"
+```
 
 ## Concurrent installs / queue
 
@@ -251,12 +299,17 @@ gnome-extensions uninstall ding@rastersoft.com
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
 
+## Contributing
+
+See [AGENTS.md](AGENTS.md) for the code-quality bar, testing requirements, and AI-assisted contribution rules. Please use the issue and pull-request templates.
+
 ## Files installed
 
 | Path | Purpose |
 |---|---|
 | `~/.local/bin/boxinstall` | the command |
 | `~/.local/share/applications/boxinstall.desktop` | app-grid launcher and MIME handler |
+| `~/.local/share/applications/boxinstall-manage.desktop` | Manage Installed Apps launcher |
 | `~/.local/share/bash-completion/completions/boxinstall` | bash completion |
 | `~/.local/state/boxinstall/boxinstall.log` | log |
 | `~/.local/state/boxinstall/previous-mime-defaults` | restored by `uninstall.sh` |

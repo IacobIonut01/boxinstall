@@ -28,3 +28,17 @@ jobs:
           sudo apt-get install -y desktop-file-utils
           sed 's|@BIN@|/home/runner/.local/bin/boxinstall|g' boxinstall.desktop.in > /tmp/boxinstall.desktop
           desktop-file-validate /tmp/boxinstall.desktop
+          sed 's|@BIN@|/home/runner/.local/bin/boxinstall|g' boxinstall-manage.desktop.in > /tmp/boxinstall-manage.desktop
+          desktop-file-validate /tmp/boxinstall-manage.desktop
+
+      - name: Management command smoke test
+        run: |
+          ./boxinstall --version
+          ./boxinstall list --json > /tmp/apps.json
+          python3 - <<'PY'
+          import json
+          with open("/tmp/apps.json") as fh:
+              apps = json.load(fh)
+          assert isinstance(apps, list)
+          print(f"Discovered {len(apps)} app(s)")
+          PY

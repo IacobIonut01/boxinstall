@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/IacobIonut01/boxinstall#readme
+    about: Installation, usage, management, CI, and troubleshooting.
+  - name: Releases
+    url: https://github.com/IacobIonut01/boxinstall/releases
+    about: Download the latest tagged release and assets.

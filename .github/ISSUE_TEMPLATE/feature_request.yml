@@ -1,0 +1,64 @@
+name: Feature request
+description: Suggest an improvement to boxinstall
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Explain the use case and how the feature should behave.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to do that is awkward today?
+      placeholder: "I want to update only the RPM apps from CI, but..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the desired behavior, flags, UI, or output.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - RPM install
+        - DEB install
+        - AppImage install
+        - Flatpak install
+        - Package review / Dependencies dialog
+        - Duplicate detection
+        - Desktop launcher / desktop icons
+        - Manage Installed Apps (GUI)
+        - list / show / update / remove / launch (CLI/CI)
+        - Queue / concurrent runs
+        - Documentation / CI / release
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Anything you tried or rejected.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and discussions.
+          required: true
+        - label: This fits boxinstall's scope (managing desktop apps/packages on Fedora Atomic/Bazzite).
+          required: true

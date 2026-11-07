@@ -59,6 +59,7 @@ app_exists() {
 say "Removing boxinstall"
 rm -f "$BIN_DIR/boxinstall"
 rm -f "$APPS_DIR/boxinstall.desktop"
+rm -f "$APPS_DIR/boxinstall-manage.desktop"
 rm -f "$COMPLETION_DIR/boxinstall"
 
 say "Restoring previous file associations"

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Manage Installed Apps
+GenericName=App Manager
+Comment=Update, remove, and launch apps managed by boxinstall
+Exec=@BIN@ manage
+TryExec=@BIN@
+Icon=system-software-install
+Terminal=false
+StartupNotify=true
+Categories=Settings;PackageManager;
+Keywords=manage;apps;packages;update;remove;boxinstall;

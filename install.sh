@@ -79,6 +79,13 @@ if command -v desktop-file-validate >/dev/null 2>&1; then
 	desktop-file-validate "$APPS_DIR/boxinstall.desktop" || true
 fi
 
+say "Installing app manager launcher"
+sed "s|@BIN@|$BIN_DIR/boxinstall|g" "$SRC_DIR/boxinstall-manage.desktop.in" >"$APPS_DIR/boxinstall-manage.desktop"
+chmod 0644 "$APPS_DIR/boxinstall-manage.desktop"
+if command -v desktop-file-validate >/dev/null 2>&1; then
+	desktop-file-validate "$APPS_DIR/boxinstall-manage.desktop" || true
+fi
+
 say "Installing shell completion"
 mkdir -p "$COMPLETION_DIR"
 install -m 0644 "$SRC_DIR/completions/boxinstall.bash" "$COMPLETION_DIR/boxinstall"
@@ -224,6 +231,7 @@ printf '  boxinstall ~/Downloads/app.rpm\n'
 printf '  boxinstall ~/Downloads/app.deb\n'
 printf '  boxinstall ~/Downloads/App.AppImage\n'
 printf '  boxinstall ~/Downloads/app.flatpakref\n'
+printf '  boxinstall manage        # open Manage Installed Apps\n'
 printf '\n'
 printf 'Or double-click a package file, or open "Install Linux App" from the app grid.\n'
 case ":$PATH:" in

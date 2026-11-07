@@ -15,7 +15,7 @@
 set -Eeuo pipefail
 
 PROG="boxinstall"
-VERSION="1.0.0"
+VERSION="1.1.0"
 SELF="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "$0")"
 
 # ---------------------------------------------------------------------------
@@ -55,6 +55,10 @@ fi
 PICK=0
 DRY_RUN=0
 VERBOSE=0
+COMMAND="install"
+OUTPUT_JSON=0
+OUTPUT_TSV=0
+ALL=0
 
 MODE="cli"
 GUI_CHILD=0
@@ -98,6 +102,14 @@ Supported packages:
   .flatpakref / .flatpak  installed with the system Flatpak
   http(s):// URLs         downloaded first, then handled as above
 
+Management:
+  boxinstall list [--json] [--tsv]   list installed apps/packages and IDs
+  boxinstall show ID                 show details for one app
+  boxinstall update ID... [--all]    update installed apps
+  boxinstall remove -y ID...         remove apps/packages
+  boxinstall launch ID               launch an app
+  boxinstall manage                  graphical app manager
+
 Options:
   -h, --help          show this help
   -V, --version       show the version
@@ -110,6 +122,9 @@ Options:
       --wait SECONDS  queue behind another running boxinstall (default 3600)
       --no-wait       fail immediately if another boxinstall is running
       --dry-run       show what would happen without changing anything
+      --json          list: JSON output
+      --tsv           list: tab-separated output
+      --all           update: all discovered apps
   -v, --verbose       more detail in the terminal
 
 Environment:
@@ -567,6 +582,7 @@ kind_label() {
 # Distrobox handling
 # ---------------------------------------------------------------------------
 list_containers() {
+	command -v distrobox >/dev/null 2>&1 || return 0
 	distrobox list --no-color 2>/dev/null |
 		awk -F'|' 'NR > 1 {
 			name=$2; image=$4;
@@ -574,6 +590,139 @@ list_containers() {
 			gsub(/^[ \t]+|[ \t]+$/, "", image);
 			if (name != "") print name "\t" image;
 		}'
+}
+
+container_kind_from_image() {
+	local image="${1,,}"
+	case "$image" in
+	*fedora* | *rhel* | *centos* | *alma* | *rocky* | *oracle*) printf 'rpm' ;;
+	*ubuntu* | *debian* | *mint* | *pop* | *kali*) printf 'deb' ;;
+	*) printf 'unknown' ;;
+	esac
+}
+
+# Emit one tab-separated record per managed/discovered app:
+# ID, Name, Version, Type, Container, Location, Desktop, Source, Size
+discover_apps() {
+	local out f base slug id name version type container location desktop size
+	local image kind pkg meta rsize size_kb p d line key
+	local -A seen=()
+	out=$(mktemp) || return 1
+
+	shopt -s nullglob
+	for f in "$APPIMAGE_DIR"/*.appimage "$APPIMAGE_DIR"/*.AppImage; do
+		[ -f "$f" ] || continue
+		base=$(basename -- "$f")
+		slug=$(slugify "${base%.*}")
+		[ -n "$slug" ] || slug="$base"
+		id="appimage:$slug"
+		[ -n "${seen[$id]:-}" ] && continue
+		seen[$id]=1
+		desktop="$APPS_DIR/$slug.desktop"
+		name=""
+		version=""
+		if [ -f "$desktop" ]; then
+			name=$(sed -n 's/^Name=//p' "$desktop" | head -n1 || true)
+			version=$(sed -n 's/^X-AppImage-Version=//p' "$desktop" | head -n1 || true)
+		fi
+		[ -n "$name" ] || name="${base%.*}"
+		size=$(human_size "$(stat -c %s "$f" 2>/dev/null || echo 0)")
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+			"$id" "$name" "${version:--}" "AppImage" "-" "$f" "$desktop" "$f" "$size" >>"$out"
+	done
+	shopt -u nullglob
+
+	if command -v flatpak >/dev/null 2>&1; then
+		while IFS=$'\t' read -r id name version location size <&3; do
+			[ -n "$id" ] || continue
+			key="flatpak:$id"
+			[ -n "${seen[$key]:-}" ] && continue
+			seen[$key]=1
+			[ -n "$name" ] || name="$id"
+			desktop=""
+			for d in \
+				"$DESKTOP_DIR/$id.desktop" \
+				"$XDG_DATA_HOME/flatpak/exports/share/applications/$id.desktop" \
+				"/var/lib/flatpak/exports/share/applications/$id.desktop"; do
+				if [ -f "$d" ]; then
+					desktop="$d"
+					break
+				fi
+			done
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+				"$key" "$name" "${version:--}" "Flatpak" "-" "${location:-unknown}" "$desktop" "$key" "${size:--}" >>"$out"
+		done 3< <(flatpak list --app --columns=application,name,version,installation,size 2>/dev/null)
+	fi
+
+	while IFS=$'\t' read -r container image <&3; do
+		[ -n "$container" ] || continue
+		kind=$(container_kind_from_image "$image")
+		for f in "$APPS_DIR/$container-"*.desktop; do
+			[ -f "$f" ] || continue
+			if grep -qE '^(NoDisplay|Hidden)=true' "$f"; then
+				continue
+			fi
+			base=$(basename -- "$f")
+			desktop_base="${base#"$container"-}"
+			name=$(sed -n 's/^Name=//p' "$f" | head -n1 || true)
+			name="${name% (on *)}"
+			pkg=""
+			version=""
+			size="-"
+			location="/usr/share/applications/$desktop_base"
+			for p in "/usr/share/applications/$desktop_base" "/usr/local/share/applications/$desktop_base"; do
+				if [ "$kind" = "rpm" ]; then
+					line=$(distrobox enter "$container" -- rpm -qf --qf '%{NAME}\t%{EPOCH}:%{VERSION}-%{RELEASE}\t%{SIZE}' "$p" 2>/dev/null </dev/null | head -n1 || true)
+					if [ -n "$line" ]; then
+						pkg=${line%%$'\t'*}
+						meta=${line#*$'\t'}
+						version=${meta%%$'\t'*}
+						rsize=${meta#*$'\t'}
+						if [ -n "$rsize" ] && [ "$rsize" -gt 0 ] 2>/dev/null; then
+							size=$(human_size "$rsize")
+						fi
+						location="$p"
+						break
+					fi
+				elif [ "$kind" = "deb" ]; then
+					line=$(distrobox enter "$container" -- dpkg -S "$p" 2>/dev/null </dev/null | head -n1 || true)
+					if [ -n "$line" ]; then
+						pkg=${line%%:*}
+						pkg=${pkg%%,*}
+						meta=$(distrobox enter "$container" -- dpkg-query -W -f="\${Version}\t\${Installed-Size}" "$pkg" 2>/dev/null </dev/null | head -n1 || true)
+						version=${meta%%$'\t'*}
+						size_kb=${meta#*$'\t'}
+						if [ -n "$size_kb" ] && [ "$size_kb" -gt 0 ] 2>/dev/null; then
+							size=$(human_size $((size_kb * 1024)))
+						fi
+						location="$p"
+						break
+					fi
+				fi
+			done
+			version="${version#(none):}"
+			[ -n "$name" ] || name="${pkg:-$desktop_base}"
+			if [ -n "$pkg" ]; then
+				id="$kind:$container:$pkg"
+				if [ "$kind" = "rpm" ]; then
+					type="RPM"
+				else
+					type="DEB"
+				fi
+			else
+				id="export:$container:$desktop_base"
+				type="Distrobox"
+				location="$f"
+			fi
+			[ -n "${seen[$id]:-}" ] && continue
+			seen[$id]=1
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+				"$id" "$name" "${version:--}" "$type" "$container" "$location" "$location" "$f" "$size" >>"$out"
+		done
+	done 3< <(list_containers)
+
+	sort -t$'\t' -k2,2 -k1,1 "$out"
+	rm -f "$out"
 }
 
 container_exists() {
@@ -1335,6 +1484,493 @@ install_flatpak() {
 }
 
 # ---------------------------------------------------------------------------
+# Management
+# ---------------------------------------------------------------------------
+resolve_app_id() {
+	local arg=$1 listfile=$2 id
+	case "$arg" in
+	*:*) printf '%s\n' "$arg"; return 0 ;;
+	esac
+	id=$(awk -F'\t' -v a="$arg" '
+		tolower($2) == tolower(a) || $1 == a || $1 ~ (":" a "$") { print $1; exit }
+	' "$listfile")
+	if [ -n "$id" ]; then
+		printf '%s\n' "$id"
+		return 0
+	fi
+	return 1
+}
+
+cmd_list() {
+	local tmp
+	tmp=$(mktemp) || die "could not create a temporary file"
+	discover_apps >"$tmp" || {
+		rm -f "$tmp"
+		die "could not discover installed apps"
+	}
+
+	if [ "$OUTPUT_JSON" -eq 1 ]; then
+		if command -v python3 >/dev/null 2>&1; then
+			python3 - "$tmp" <<'PY'
+import csv, json, sys
+rows = []
+with open(sys.argv[1], newline="") as fh:
+    for row in csv.reader(fh, delimiter="\t"):
+        if len(row) < 9:
+            continue
+        rows.append({
+            "id": row[0],
+            "name": row[1],
+            "version": row[2],
+            "type": row[3],
+            "container": row[4],
+            "location": row[5],
+            "desktop": row[6],
+            "source": row[7],
+            "size": row[8],
+        })
+json.dump(rows, sys.stdout, indent=2)
+sys.stdout.write("\n")
+PY
+		else
+			warn "python3 not found; falling back to TSV"
+			cat "$tmp"
+		fi
+	elif [ "$OUTPUT_TSV" -eq 1 ]; then
+		cat "$tmp"
+	else
+		{
+			printf 'NAME\tVERSION\tTYPE\tCONTAINER\tSIZE\tID\n'
+			awk -F'\t' '{ print $2 "\t" $3 "\t" $4 "\t" $5 "\t" $9 "\t" $1 }' "$tmp"
+		} | if command -v column >/dev/null 2>&1; then
+			column -t -s $'\t'
+		else
+			cat
+		fi
+	fi
+	rm -f "$tmp"
+}
+
+cmd_show() {
+	[ $# -gt 0 ] || die "usage: $PROG show ID|NAME"
+	local tmp id arg found=0
+	tmp=$(mktemp) || die "could not create a temporary file"
+	discover_apps >"$tmp" || {
+		rm -f "$tmp"
+		die "could not discover installed apps"
+	}
+	for arg in "$@"; do
+		id=$(resolve_app_id "$arg" "$tmp") || {
+			warn "not found: $arg"
+			continue
+		}
+		if awk -F'\t' -v id="$id" '
+			$1 == id {
+				printf "ID:        %s\nName:      %s\nVersion:   %s\nType:      %s\nContainer: %s\nLocation:  %s\nDesktop:   %s\nSource:    %s\nSize:      %s\n",
+					$1, $2, $3, $4, $5, $6, $7, $8, $9
+				found = 1
+			}
+			END { exit !found }
+		' "$tmp"; then
+			found=1
+		fi
+	done
+	rm -f "$tmp"
+	[ "$found" -eq 1 ] || return 1
+}
+
+update_flatpak() {
+	local id=$1 installations inst rc=0
+	installations=$(flatpak list --app --columns=application,installation 2>/dev/null |
+		awk -F'\t' -v id="$id" '$1 == id { print $2 }')
+	if [ -z "$installations" ]; then
+		warn "Flatpak not installed: $id"
+		return 1
+	fi
+	for inst in $installations; do
+		case "$inst" in
+		system)
+			if sudo -n true 2>/dev/null; then
+				run sudo -n flatpak update --system --noninteractive -y "$id" </dev/null || rc=1
+			else
+				run flatpak update --system --noninteractive -y "$id" </dev/null || rc=1
+			fi
+			;;
+		user)
+			run flatpak update --user --noninteractive -y "$id" </dev/null || rc=1
+			;;
+		esac
+	done
+	return "$rc"
+}
+
+update_one() {
+	local id=$1 type a b
+	IFS=: read -r type a b <<<"$id"
+	case "$type" in
+	rpm)
+		say "Updating RPM $b in $a..."
+		run distrobox enter "$a" -- sudo dnf -y upgrade "$b" </dev/null
+		;;
+	deb)
+		apt_update_if_needed "$a"
+		say "Updating DEB $b in $a..."
+		run distrobox enter "$a" -- sudo env DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y "$b" </dev/null
+		;;
+	flatpak)
+		say "Updating Flatpak $a..."
+		update_flatpak "$a"
+		;;
+	appimage)
+		warn "AppImage $a has no update source; reinstall with: $PROG /path/to/new.AppImage"
+		return 1
+		;;
+	export | *)
+		warn "cannot update $id automatically"
+		return 1
+		;;
+	esac
+}
+
+cmd_update() {
+	acquire_lock
+	local tmp id arg failures=0
+	local -a ids=()
+	tmp=$(mktemp) || die "could not create a temporary file"
+	discover_apps >"$tmp" || {
+		rm -f "$tmp"
+		die "could not discover installed apps"
+	}
+	if [ "$ALL" -eq 1 ]; then
+		mapfile -t ids < <(awk -F'\t' '$4 == "RPM" || $4 == "DEB" || $4 == "Flatpak" { print $1 }' "$tmp")
+	elif [ $# -gt 0 ]; then
+		for arg in "$@"; do
+			id=$(resolve_app_id "$arg" "$tmp") || {
+				warn "not found: $arg"
+				continue
+			}
+			ids+=("$id")
+		done
+	else
+		rm -f "$tmp"
+		die "usage: $PROG update ID... | $PROG update --all"
+	fi
+	rm -f "$tmp"
+	if [ ${#ids[@]} -eq 0 ]; then
+		die "nothing to update"
+	fi
+	for id in "${ids[@]}"; do
+		if ! update_one "$id"; then
+			failures=$((failures + 1))
+		fi
+	done
+	if [ "$failures" -ne 0 ]; then
+		warn "$failures app(s) could not be updated"
+		return 1
+	fi
+	say "Update complete"
+}
+
+remove_one() {
+	local id=$1 type a b
+	local -a desktops=()
+	local d p inst installations f
+	IFS=: read -r type a b <<<"$id"
+	case "$type" in
+	rpm)
+		mapfile -t desktops < <(distrobox enter "$a" -- rpm -ql "$b" 2>/dev/null </dev/null |
+			grep -E '^/(usr/share|usr/local/share|opt/.+/share)/applications/.+\.desktop$' || true)
+		for d in "${desktops[@]}"; do
+			run distrobox enter "$a" -- distrobox-export --app "$d" --delete </dev/null || warn "could not remove export $d"
+			rm -f "$DESKTOP_DIR/${a}-$(basename "$d")"
+		done
+		say "Removing RPM $b from $a..."
+		run distrobox enter "$a" -- sudo dnf -y remove "$b" </dev/null
+		;;
+	deb)
+		mapfile -t desktops < <(distrobox enter "$a" -- dpkg -L "$b" 2>/dev/null </dev/null |
+			grep -E '^/(usr/share|usr/local/share|opt/.+/share)/applications/.+\.desktop$' || true)
+		for d in "${desktops[@]}"; do
+			run distrobox enter "$a" -- distrobox-export --app "$d" --delete </dev/null || warn "could not remove export $d"
+			rm -f "$DESKTOP_DIR/${a}-$(basename "$d")"
+		done
+		say "Removing DEB $b from $a..."
+		run distrobox enter "$a" -- sudo env DEBIAN_FRONTEND=noninteractive apt-get remove -y "$b" </dev/null
+		;;
+	flatpak)
+		installations=$(flatpak list --app --columns=application,installation 2>/dev/null |
+			awk -F'\t' -v id="$a" '$1 == id { print $2 }')
+		if [ -z "$installations" ]; then
+			warn "Flatpak not installed: $a"
+			return 1
+		fi
+		for inst in $installations; do
+			case "$inst" in
+			system)
+				if sudo -n true 2>/dev/null; then
+					run sudo -n flatpak uninstall --system --noninteractive -y "$a" </dev/null || return 1
+				else
+					run flatpak uninstall --system --noninteractive -y "$a" </dev/null || return 1
+				fi
+				;;
+			user)
+				run flatpak uninstall --user --noninteractive -y "$a" </dev/null || return 1
+				;;
+			esac
+		done
+		rm -f "$DESKTOP_DIR/$a.desktop" "$APPS_DIR/$a.desktop"
+		;;
+	appimage)
+		rm -f "$APPIMAGE_DIR/$a.appimage" "$APPIMAGE_DIR/$a.AppImage"
+		rm -f "$APPS_DIR/$a.desktop" "$DESKTOP_DIR/$a.desktop"
+		rm -f "$APPIMAGE_DIR/.icons/$a" "$APPIMAGE_DIR/.icons/$a".*
+		;;
+	export)
+		f="$APPS_DIR/${a}-${b}"
+		for p in "/usr/share/applications/$b" "/usr/local/share/applications/$b"; do
+			run distrobox enter "$a" -- distrobox-export --app "$p" --delete </dev/null || true
+		done
+		rm -f "$f" "$DESKTOP_DIR/${a}-${b}"
+		;;
+	*)
+		warn "unsupported id: $id"
+		return 1
+		;;
+	esac
+	refresh_desktop_db
+}
+
+cmd_remove() {
+	[ $# -gt 0 ] || die "usage: $PROG remove -y ID..."
+	if [ "$AUTO_YES" -ne 1 ]; then
+		if [ ! -t 0 ]; then
+			die "refusing to remove without -y/--yes in non-interactive mode"
+		fi
+		printf 'Remove %s? [y/N] ' "$*" >&2
+		local answer=""
+		read -r answer || answer=""
+		case "$answer" in
+		y | Y | yes | YES) ;;
+		*) return 0 ;;
+		esac
+	fi
+	acquire_lock
+	local tmp id arg failures=0
+	local -a ids=()
+	tmp=$(mktemp) || die "could not create a temporary file"
+	discover_apps >"$tmp" || {
+		rm -f "$tmp"
+		die "could not discover installed apps"
+	}
+	for arg in "$@"; do
+		id=$(resolve_app_id "$arg" "$tmp") || {
+			warn "not found: $arg"
+			continue
+		}
+		ids+=("$id")
+	done
+	rm -f "$tmp"
+	for id in "${ids[@]}"; do
+		if ! remove_one "$id"; then
+			failures=$((failures + 1))
+		fi
+	done
+	if [ "$failures" -ne 0 ]; then
+		warn "$failures app(s) could not be removed"
+		return 1
+	fi
+	say "Removal complete"
+}
+
+cmd_launch() {
+	[ $# -eq 1 ] || die "usage: $PROG launch ID"
+	local id=$1 type a b tmp src rc=0
+	IFS=: read -r type a b <<<"$id"
+	case "$type" in
+	rpm | deb | export)
+		tmp=$(mktemp) || die "could not create a temporary file"
+		discover_apps >"$tmp" || {
+			rm -f "$tmp"
+			die "could not discover installed apps"
+		}
+		src=$(awk -F'\t' -v id="$id" '$1 == id { print $8; exit }' "$tmp")
+		rm -f "$tmp"
+		if [ -z "$src" ] || [ ! -f "$src" ]; then
+			warn "launcher not found for $id"
+			return 1
+		fi
+		setsid gio launch "$src" >/dev/null 2>&1 &
+		;;
+	flatpak)
+		setsid flatpak run "$a" >/dev/null 2>&1 &
+		;;
+	appimage)
+		if [ ! -x "$APPIMAGE_DIR/$a.appimage" ] && [ ! -x "$APPIMAGE_DIR/$a.AppImage" ]; then
+			warn "AppImage not found or not executable: $a"
+			return 1
+		fi
+		if [ -x "$APPIMAGE_DIR/$a.appimage" ]; then
+			setsid "$APPIMAGE_DIR/$a.appimage" >/dev/null 2>&1 &
+		else
+			setsid "$APPIMAGE_DIR/$a.AppImage" >/dev/null 2>&1 &
+		fi
+		;;
+	*)
+		warn "cannot launch $id"
+		rc=1
+		;;
+	esac
+	return "$rc"
+}
+
+run_manager_action() {
+	local action=$1 id=$2 name=$3 log rc
+	log=$(mktemp) || return 1
+	{
+		printf '# %s: %s\n' "${action^}" "$name"
+		"$SELF" "$action" -y "$id" >"$log" 2>&1
+		printf '%s\n' "$?" >"$log.rc"
+		printf '# Done\n'
+	} | zenity --progress --pulsate --auto-close --no-cancel \
+		--title="${action^} $name" --text="Working..." --width=540
+	rc=$(cat "$log.rc" 2>/dev/null || echo 1)
+	if [ "$rc" -eq 0 ]; then
+		zenity --info --no-markup --title="${action^} complete" \
+			--text="$name ${action}d." --width=440 2>/dev/null || true
+	else
+		zenity --error --no-markup --title="${action^} failed" \
+			--text="Could not $action $name." \
+			--details="$(tail -n 120 "$log" 2>/dev/null)" --width=640 2>/dev/null || true
+	fi
+	rm -f "$log" "$log.rc"
+	return "$rc"
+}
+
+cmd_manage() {
+	command -v zenity >/dev/null 2>&1 || die "manage needs zenity"
+	[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] || die "manage needs a graphical session"
+
+	local tmp id action file details reload=1
+	local -a rows=() APP_IDS=()
+	local -A APP_NAME=() APP_VERSION=() APP_TYPE=() APP_CONTAINER=()
+	local -A APP_LOCATION=() APP_DESKTOP=() APP_SOURCE=() APP_SIZE=()
+	tmp=$(mktemp) || die "could not create a temporary file"
+	TMP_DIRS+=("$tmp")
+
+	while :; do
+		if [ "$reload" -eq 1 ]; then
+			{
+				echo "# Discovering installed apps..."
+				discover_apps >"$tmp" 2>>"$LOG_FILE"
+				echo "# Done"
+			} | zenity --progress --pulsate --auto-close --no-cancel \
+				--title="Manage Installed Apps" --text="Loading..." --width=540
+
+			APP_IDS=()
+			APP_NAME=()
+			APP_VERSION=()
+			APP_TYPE=()
+			APP_CONTAINER=()
+			APP_LOCATION=()
+			APP_DESKTOP=()
+			APP_SOURCE=()
+			APP_SIZE=()
+			while IFS=$'\t' read -r id tmp_name tmp_version tmp_type tmp_container tmp_location tmp_desktop tmp_source tmp_size; do
+				[ -n "$id" ] || continue
+				APP_IDS+=("$id")
+				APP_NAME[$id]="$tmp_name"
+				APP_VERSION[$id]="$tmp_version"
+				APP_TYPE[$id]="$tmp_type"
+				APP_CONTAINER[$id]="$tmp_container"
+				APP_LOCATION[$id]="$tmp_location"
+				APP_DESKTOP[$id]="$tmp_desktop"
+				APP_SOURCE[$id]="$tmp_source"
+				APP_SIZE[$id]="$tmp_size"
+			done <"$tmp"
+			reload=0
+		fi
+
+		if [ ${#APP_IDS[@]} -eq 0 ]; then
+			zenity --info --no-markup --title="Manage Installed Apps" \
+				--text="No installed apps were found." --width=420 2>/dev/null || true
+			return 0
+		fi
+
+		rows=()
+		for id in "${APP_IDS[@]}"; do
+			rows+=("$id" "${APP_NAME[$id]}" "${APP_VERSION[$id]}" "${APP_TYPE[$id]}" "${APP_CONTAINER[$id]}" "${APP_SIZE[$id]}")
+		done
+
+		id=$(zenity --list --title="Manage Installed Apps" \
+			--text="Select an app to manage." \
+			--column="ID" --column="App" --column="Version" --column="Type" \
+			--column="Container" --column="Size" \
+			--hide-column=1 --print-column=1 --width=1100 --height=650 \
+			"${rows[@]}") || return 0
+		[ -n "$id" ] || continue
+
+		while :; do
+			local -a actions=(
+				"details" "Show details"
+				"launch" "Launch"
+			)
+			if [ "${APP_TYPE[$id]}" = "AppImage" ]; then
+				actions+=("update" "Reinstall from file…")
+			elif [ "${APP_TYPE[$id]}" != "Distrobox" ]; then
+				actions+=("update" "Update / Reinstall")
+			fi
+			actions+=("remove" "Remove" "back" "Back")
+
+			action=$(zenity --list --title="${APP_NAME[$id]}" \
+				--text="What do you want to do with ${APP_NAME[$id]}?" \
+				--column="Action" --column="Description" --hide-column=1 --print-column=1 \
+				--width=520 --height=320 "${actions[@]}") || break
+			[ -n "$action" ] || continue
+
+			case "$action" in
+			details)
+				details=$(printf 'ID:        %s\nName:      %s\nVersion:   %s\nType:      %s\nContainer: %s\nLocation:  %s\nDesktop:   %s\nSource:    %s\nSize:      %s' \
+					"$id" "${APP_NAME[$id]}" "${APP_VERSION[$id]}" "${APP_TYPE[$id]}" "${APP_CONTAINER[$id]}" \
+					"${APP_LOCATION[$id]}" "${APP_DESKTOP[$id]}" "${APP_SOURCE[$id]}" "${APP_SIZE[$id]}")
+				zenity --info --no-markup --title="${APP_NAME[$id]}" --text="$details" --width=720 2>/dev/null || true
+				;;
+			launch)
+				if ! "$SELF" launch "$id" >/dev/null 2>&1; then
+					zenity --error --no-markup --title="Launch failed" \
+						--text="Could not launch ${APP_NAME[$id]}." --width=440 2>/dev/null || true
+				fi
+				;;
+			update)
+				if [ "${APP_TYPE[$id]}" = "AppImage" ]; then
+					file=$(zenity --file-selection --title="Choose the new AppImage for ${APP_NAME[$id]}" \
+						--file-filter="AppImage | *.AppImage *.appimage" 2>/dev/null) || continue
+					[ -n "$file" ] || continue
+					"$SELF" "$file"
+					reload=1
+					break
+				fi
+				run_manager_action update "$id" "${APP_NAME[$id]}" || true
+				reload=1
+				break
+				;;
+			remove)
+				if zenity --question --no-markup --title="Remove ${APP_NAME[$id]}" \
+					--text="Remove ${APP_NAME[$id]}?" --ok-label="Remove" --cancel-label="Cancel" \
+					--width=440 2>/dev/null; then
+					run_manager_action remove "$id" "${APP_NAME[$id]}" || true
+					reload=1
+					break
+				fi
+				;;
+			back)
+				break
+				;;
+			esac
+		done
+	done
+}
+
+# ---------------------------------------------------------------------------
 # Download and dispatch
 # ---------------------------------------------------------------------------
 download_url() {
@@ -1401,6 +2037,15 @@ install_target() {
 # Main
 # ---------------------------------------------------------------------------
 main() {
+	COMMAND="install"
+	if [ $# -gt 0 ]; then
+		case "$1" in
+		list | update | remove | manage | launch | show)
+			COMMAND="$1"
+			shift
+			;;
+		esac
+	fi
 	FILES=()
 
 	while [ $# -gt 0 ]; do
@@ -1443,6 +2088,15 @@ main() {
 		--dry-run)
 			DRY_RUN=1
 			;;
+		--json)
+			OUTPUT_JSON=1
+			;;
+		--tsv)
+			OUTPUT_TSV=1
+			;;
+		--all)
+			ALL=1
+			;;
 		-v | --verbose)
 			VERBOSE=1
 			;;
@@ -1484,6 +2138,18 @@ main() {
 	if [ "${BOXINSTALL_GUI_CHILD:-0}" = "1" ]; then
 		MODE="gui-child"
 		GUI_CHILD=1
+	fi
+
+	if [ "$COMMAND" != "install" ]; then
+		case "$COMMAND" in
+		list) cmd_list ;;
+		show) cmd_show "${FILES[@]}" ;;
+		update) cmd_update "${FILES[@]}" ;;
+		remove) cmd_remove "${FILES[@]}" ;;
+		launch) cmd_launch "${FILES[@]}" ;;
+		manage) cmd_manage ;;
+		esac
+		exit $?
 	fi
 
 	# If --pick was requested from a terminal, force the graphical picker.
