@@ -166,7 +166,9 @@ require_cmd() {
 cleanup() {
 	local dir
 	for dir in ${TMP_DIRS[@]+"${TMP_DIRS[@]}"}; do
-		[ -n "$dir" ] && rm -rf -- "$dir" 2>/dev/null || true
+		if [ -n "$dir" ]; then
+			rm -rf -- "$dir" 2>/dev/null || true
+		fi
 	done
 	if [ "$LOCK_ACQUIRED" -eq 1 ]; then
 		rm -rf -- "$LOCK_DIR" 2>/dev/null || true
@@ -236,10 +238,10 @@ rpm_version_relation() {
 	local old=$1 new=$2 cmp
 	old="${old#(none):}"
 	new="${new#(none):}"
-	[ -n "$old" ] && [ -n "$new" ] || {
+	if [ -z "$old" ] || [ -z "$new" ]; then
 		printf 'different'
 		return 0
-	}
+	fi
 	cmp=$(rpm --eval '%{lua: print(rpm.vercmp("'"$old"'", "'"$new"'"))}' 2>/dev/null || true)
 	case "$cmp" in
 	0 | 0.0) printf 'same' ;;
@@ -251,10 +253,10 @@ rpm_version_relation() {
 
 deb_version_relation() {
 	local box=$1 old=$2 new=$3
-	[ -n "$old" ] && [ -n "$new" ] || {
+	if [ -z "$old" ] || [ -z "$new" ]; then
 		printf 'different'
 		return 0
-	}
+	fi
 	if distrobox enter "$box" -- dpkg --compare-versions "$old" eq "$new" 2>/dev/null; then
 		printf 'same'
 	elif distrobox enter "$box" -- dpkg --compare-versions "$old" lt "$new" 2>/dev/null; then
@@ -1115,7 +1117,9 @@ install_flatpak() {
 download_url() {
 	local url=$1 dir=$2 name dest
 	name=$(basename "${url%%\?*}")
-	[ -n "$name" ] && [ "$name" != "/" ] || name="download"
+	if [ -z "$name" ] || [ "$name" = "/" ]; then
+		name="download"
+	fi
 	dest="$dir/$name"
 	say "Downloading $url" >&2
 	if ! run curl -fL --retry 3 --connect-timeout 20 --progress-bar -o "$dest" "$url" >&2; then
