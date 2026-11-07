@@ -39,6 +39,8 @@
 
 <!-- Disclose any AI-assisted development. Say which parts were AI-generated or AI-reviewed. -->
 
+- [ ] The commits include `Co-authored-by: OpenCode <noreply@opencode.ai>` (the repo hook adds it).
+
 ## Related issues
 
 <!-- Fixes #... / Relates to #... -->

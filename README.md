@@ -3,7 +3,7 @@
 [![CI](https://github.com/IacobIonut01/boxinstall/actions/workflows/ci.yml/badge.svg)](https://github.com/IacobIonut01/boxinstall/actions/workflows/ci.yml)
 [![Release](https://github.com/IacobIonut01/boxinstall/actions/workflows/release.yml/badge.svg)](https://github.com/IacobIonut01/boxinstall/actions/workflows/release.yml)
 
-> **AI-assisted disclaimer:** this project is developed with the assistance of AI coding tools. AI-generated changes are reviewed and tested and must pass CI, but mistakes are still possible. Review the scripts before running them and please report issues using the templates.
+> **AI-assisted disclaimer:** this project is developed with the assistance of AI coding tools. AI-generated changes are reviewed and tested and must pass CI, but mistakes are still possible. Review the scripts before running them and please report issues using the templates. Commits credit the assistant with `Co-authored-by: OpenCode <noreply@opencode.ai>`.
 
 A one-click installer for Linux packages on **Bazzite / Fedora Atomic (Silverblue, Kinoite, …)**.
 
@@ -303,6 +303,14 @@ GPL-3.0-or-later. See [LICENSE](LICENSE).
 ## Contributing
 
 See [AGENTS.md](AGENTS.md) for the code-quality bar, testing requirements, and AI-assisted contribution rules. Please use the issue and pull-request templates.
+
+After cloning, enable the tracked commit hook and message template:
+
+```bash
+./scripts/setup-dev.sh
+```
+
+This makes every commit include `Co-authored-by: OpenCode <noreply@opencode.ai>`.
 
 ## Files installed
 

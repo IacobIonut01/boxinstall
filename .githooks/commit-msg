@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Ensure AI-assistance co-author credit on every commit in this repository.
+set -euo pipefail
+
+msg_file="${1:?commit message file missing}"
+trailer="Co-authored-by: OpenCode <noreply@opencode.ai>"
+
+if ! grep -qiE '^Co-authored-by:[[:space:]]*OpenCode([[:space:]]|<)' "$msg_file"; then
+	# Git trailers must live in the final paragraph, separated by a blank line.
+	printf '\n%s\n' "$trailer" >>"$msg_file"
+fi

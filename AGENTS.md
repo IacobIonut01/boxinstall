@@ -160,6 +160,11 @@ Test `list`, `show`, `update`, `remove`, and `launch` using IDs from `list --tsv
 AI tools are allowed and expected, but the human/agent submitting the change is responsible for it.
 
 - Disclose AI assistance in the PR template and describe which parts were AI-generated or AI-reviewed.
+- Every commit must credit the assistant with:
+  ```
+  Co-authored-by: OpenCode <noreply@opencode.ai>
+  ```
+  The tracked `.githooks/commit-msg` hook adds this automatically. Run `./scripts/setup-dev.sh` after cloning so the hook and `.gitmessage` are active. Do not remove the trailer from AI-assisted commits.
 - Do not invent commands, flags, APIs, or dependency behavior. Verify against the actual system or documentation.
 - Do not claim testing that was not performed.
 - Prefer small, reviewable changes with a clear test plan.
@@ -176,5 +181,6 @@ A change is done only when:
 - [ ] Relevant isolated tests were run and cleaned up.
 - [ ] `--help` and README are updated.
 - [ ] The diff contains no secrets, logs, caches, or unrelated changes.
+- [ ] The commit includes the OpenCode co-author trailer.
 - [ ] CI passes.
 - [ ] The PR template is filled in, including AI disclosure and testing evidence.

@@ -1,3 +1,6 @@
 /.github export-ignore
 /.gitignore export-ignore
 /.gitattributes export-ignore
+/.githooks export-ignore
+/.gitmessage export-ignore
+/scripts export-ignore

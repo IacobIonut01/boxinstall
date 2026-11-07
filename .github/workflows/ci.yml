@@ -16,6 +16,8 @@ jobs:
           bash -n install.sh
           bash -n uninstall.sh
           bash -n completions/boxinstall.bash
+          bash -n .githooks/commit-msg
+          bash -n scripts/setup-dev.sh
           python3 -m py_compile manager.py
 
       - name: ShellCheck
@@ -23,6 +25,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y shellcheck
           shellcheck boxinstall install.sh uninstall.sh completions/boxinstall.bash
+          shellcheck .githooks/commit-msg scripts/setup-dev.sh
 
       - name: Desktop entry validation
         run: |
