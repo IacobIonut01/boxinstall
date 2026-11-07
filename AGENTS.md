@@ -11,11 +11,12 @@ If you change behavior, you are responsible for testing it and updating the docu
 - installs RPMs in Fedora-compatible distroboxes;
 - installs DEBs in Ubuntu/Debian distroboxes;
 - installs AppImages under `~/AppImages`;
+- extracts tarballs under `~/.local/opt`;
 - installs Flatpaks system-wide (with user-scope fallback);
 - exports launchers to the GNOME application menu and `~/Desktop`;
 - reviews package details, sizes, dependencies, and duplicate versions before installing;
 - queues concurrent UI/CI runs;
-- lists, updates, removes, and launches installed apps from the CLI and a Zenity GUI.
+- lists, updates, removes, and launches installed apps from the CLI and a GTK4 manager (Zenity fallback).
 
 Do not add host-level `rpm-ostree` layering, Snap support, `.run` installers, daemons, or background services. Keep the tool user-invoked and rootless except for Flatpak operations that require system authorization.
 
@@ -30,7 +31,7 @@ Do not add host-level `rpm-ostree` layering, Snap support, `.run` installers, da
 | Detection | file type and MIME detection, URL handling |
 | Distrobox handling | container discovery/creation, snapshots |
 | Shortcuts/exports | `distrobox-export`, trusted Desktop copies |
-| RPM / DEB / AppImage / Flatpak | per-format metadata, review, install |
+| RPM / DEB / AppImage / Tarball / Flatpak | per-format metadata, review, install |
 | Management | discovery, `list`/`show`/`update`/`remove`/`launch`, `manage` GUI |
 | Dispatch | `install_target`, argument parsing, command routing |
 
@@ -113,6 +114,7 @@ Testing must cover real behavior, not just syntax.
 | RPM | Install a small real RPM in a throwaway Fedora container; verify review fields, install, launcher, duplicate review, `remove` |
 | DEB | Install a small real DEB in a throwaway Ubuntu container; verify review fields, install, launcher, duplicate review, `remove` |
 | AppImage | Install a real AppImage; verify review, launcher, `list`, `remove` |
+| Tarball | Extract a real `.tar.gz` to a fake HOME/destination; verify executable/icon detection, launcher, `list`, `remove`, duplicate review |
 | Flatpak | Verify review/list/update where feasible; avoid removing unrelated system apps |
 | GUI | Test review/manager flows with a mock Zenity or a real graphical session |
 | Queue | Test `--wait`, `--no-wait`, timeout, and stale-lock recovery |
@@ -132,6 +134,7 @@ Test `list`, `show`, `update`, `remove`, and `launch` using IDs from `list --tsv
 - RPM review: use `rpm -qp` for name/version/arch/size/summary and `rpm -qpR` for raw requirements.
 - DEB review: use `dpkg-deb -f` for fields and dependency lists; `Installed-Size` is KiB.
 - AppImage review: show file size, architecture, destination, and that libraries are bundled.
+- Tarball review: show archive type, name/version, architecture, destination, extracted size, executable, and `ldd` output; prefer embedded `.desktop`/Electron metadata, then a runnable ELF.
 - Flatpak review: show app ID, branch, remote, ref file, installed version/size, and runtime when installed.
 - Clearly label estimates. Do not present a package's own installed size as the total transaction size; note that the package manager resolves/downloads dependencies.
 - Filter RPM `rpmlib(...)` requirements out of the dependency view.
@@ -144,6 +147,7 @@ Test `list`, `show`, `update`, `remove`, and `launch` using IDs from `list --tsv
 - Flatpak operations are system-wide by default; use the existing `sudo -n`/Polkit fallback pattern.
 - Confirm destructive removals. CLI `remove` must require `-y` in non-interactive mode.
 - Do not remove dependencies with `autoremove`; only remove the selected package/app.
+- Tarball extraction must reject absolute paths and `..` members, and use `--no-same-owner --no-same-permissions`. Never write archive symlink targets outside the managed destination.
 - Do not remove Desktop Icons NG on uninstall; document the manual commands instead.
 - Keep the waiting queue for all mutating operations. Never bypass it in GUI actions.
 

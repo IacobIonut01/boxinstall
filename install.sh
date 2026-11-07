@@ -16,6 +16,7 @@ MIMES=(
 	application/x-deb
 	application/vnd.appimage
 	application/x-iso9660-appimage
+	application/x-compressed-tar
 	application/vnd.flatpak.ref
 	application/vnd.flatpak
 )
@@ -65,12 +66,14 @@ install -m 0755 "$SRC_DIR/boxinstall" "$BIN_DIR/boxinstall"
 # otherwise xdg-mime can report our handler as the "previous" default.
 if [ ! -f "$MIME_DEFAULTS_FILE" ]; then
 	: >"$MIME_DEFAULTS_FILE"
-	for mime in "${MIMES[@]}"; do
+fi
+for mime in "${MIMES[@]}"; do
+	if ! grep -q "^${mime}=" "$MIME_DEFAULTS_FILE"; then
 		prev=$(xdg-mime query default "$mime" 2>/dev/null || true)
 		[ "$prev" = "boxinstall.desktop" ] && prev=""
 		printf '%s=%s\n' "$mime" "$prev" >>"$MIME_DEFAULTS_FILE"
-	done
-fi
+	fi
+done
 
 say "Installing application launcher"
 sed "s|@BIN@|$BIN_DIR/boxinstall|g" "$SRC_DIR/boxinstall.desktop.in" >"$APPS_DIR/boxinstall.desktop"

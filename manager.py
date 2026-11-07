@@ -421,7 +421,7 @@ class ManagerWindow(Adw.ApplicationWindow):
         box.append(title)
 
         subtitle = Gtk.Label(
-            label="RPM · DEB · AppImage · Flatpakref · Flatpak"
+            label="RPM · DEB · AppImage · tar.gz · Flatpakref · Flatpak"
         )
         subtitle.add_css_class("dim-label")
         subtitle.set_justify(Gtk.Justification.CENTER)
@@ -549,7 +549,7 @@ class ManagerWindow(Adw.ApplicationWindow):
         self.rows["desktop"].set_subtitle(item.desktop or "-")
         self.rows["source"].set_subtitle(item.source or "-")
 
-        if item.type == "AppImage":
+        if item.type in ("AppImage", "Tarball"):
             self.btn_update.set_label("Reinstall from file…")
             self.btn_update.set_sensitive(True)
         elif item.type == "Distrobox":
@@ -561,12 +561,12 @@ class ManagerWindow(Adw.ApplicationWindow):
 
     def _show_multi(self, items: list[AppItem]):
         self.multi_title.set_text(f"{len(items)} apps selected")
-        # AppImage updates need a replacement file. If the selection is all
-        # AppImages, make that explicit by disabling the update button.
-        if all(item.type == "AppImage" for item in items):
+        # AppImage and tarball updates need a replacement file. If the
+        # selection is all file-based apps, make that explicit.
+        if all(item.type in ("AppImage", "Tarball") for item in items):
             self.btn_bulk_update.set_sensitive(False)
             self.btn_bulk_update.set_tooltip_text(
-                "AppImage updates require selecting a replacement file individually."
+                "AppImage and tarball updates require selecting a replacement file individually."
             )
         else:
             self.btn_bulk_update.set_sensitive(True)
@@ -671,8 +671,8 @@ class ManagerWindow(Adw.ApplicationWindow):
         items = list(self.current_items)
         if not items:
             return
-        if len(items) == 1 and items[0].type == "AppImage":
-            self._choose_appimage(items[0])
+        if len(items) == 1 and items[0].type in ("AppImage", "Tarball"):
+            self._choose_source_file(items[0])
             return
 
         updatable = [
@@ -684,7 +684,7 @@ class ManagerWindow(Adw.ApplicationWindow):
             self._toast("No updatable packages selected.")
             return
         if skipped:
-            self._toast(f"Skipped {skipped} AppImage/Distrobox item(s).")
+            self._toast(f"Skipped {skipped} AppImage/Tarball/Distrobox item(s).")
         self._run_action("update", updatable)
 
     def _remove_selected(self):
@@ -697,7 +697,7 @@ class ManagerWindow(Adw.ApplicationWindow):
         dialog = Adw.MessageDialog(
             transient_for=self,
             heading=f"Remove {len(items)} app{'s' if len(items) != 1 else ''}?",
-            body=f"{names}\n\nThis removes the package/Flatpak/AppImage and its launcher.",
+            body=f"{names}\n\nThis removes the package/Flatpak/AppImage/tarball and its launcher.",
         )
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("remove", "Remove")
@@ -752,12 +752,24 @@ class ManagerWindow(Adw.ApplicationWindow):
             self._toast(f"{'Updated' if action == 'update' else 'Removed'}.")
         self.reload()
 
-    def _choose_appimage(self, item: AppItem):
-        dialog = Gtk.FileDialog(title=f"Choose a new AppImage for {item.name}")
+    def _choose_source_file(self, item: AppItem):
+        if item.type == "Tarball":
+            title = f"Choose the new package for {item.name}"
+            filter_name = "Tarball packages"
+            patterns = [
+                "*.tar.gz", "*.tgz", "*.tar.xz", "*.txz",
+                "*.tar.zst", "*.tzst", "*.tar.bz2", "*.tbz2", "*.tar",
+            ]
+        else:
+            title = f"Choose a new AppImage for {item.name}"
+            filter_name = "AppImage packages"
+            patterns = ["*.AppImage", "*.appimage"]
+
+        dialog = Gtk.FileDialog(title=title)
         file_filter = Gtk.FileFilter()
-        file_filter.set_name("AppImage packages")
-        file_filter.add_pattern("*.AppImage")
-        file_filter.add_pattern("*.appimage")
+        file_filter.set_name(filter_name)
+        for pattern in patterns:
+            file_filter.add_pattern(pattern)
         filters = Gio.ListStore.new(Gtk.FileFilter)
         filters.append(file_filter)
         dialog.set_filters(filters)

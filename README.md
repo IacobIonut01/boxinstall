@@ -7,12 +7,12 @@
 
 A one-click installer for Linux packages on **Bazzite / Fedora Atomic (Silverblue, Kinoite, …)**.
 
-Double-click an `.rpm`, `.deb`, `.AppImage`, `.flatpakref`, or `.flatpak` file and it:
+Double-click an `.rpm`, `.deb`, `.AppImage`, `.tar.gz`, `.flatpakref`, or `.flatpak` file and it:
 
 1. shows a review with package details, estimated size, and a Dependencies window,
 2. picks the right installation method,
 3. reuses or creates the needed distrobox,
-4. installs the app with `dnf`, `apt`, `flatpak`, or natively for AppImages,
+4. installs the app with `dnf`, `apt`, `flatpak`, or natively for AppImages/tarballs,
 5. exports the app to the GNOME application menu,
 6. places a trusted launcher on your GNOME desktop.
 
@@ -22,6 +22,7 @@ The same thing works from a terminal:
 boxinstall ~/Downloads/google-chrome-stable_current_x86_64.rpm
 boxinstall ~/Downloads/code_1.99_amd64.deb
 boxinstall ~/Downloads/Obsidian-1.8.10.AppImage
+boxinstall /var/mnt/f/Downloads/Devin-linux-x64-3.12.17.tar.gz
 boxinstall ~/Downloads/app.flatpakref
 boxinstall https://example.org/app.rpm
 ```
@@ -50,6 +51,7 @@ Just double-click a package file in Files/Nautilus. `boxinstall` is the default 
 | `.rpm` | `application/x-rpm` | `dnf` in a Fedora distrobox |
 | `.deb` | `application/vnd.debian.binary-package` | `apt` in an Ubuntu distrobox |
 | `.AppImage` / `.appimage` | `application/vnd.appimage` | copied to `~/AppImages` |
+| `.tar.gz` / `.tgz` | `application/x-compressed-tar` | extracted to `~/.local/opt` |
 | `.flatpakref` | `application/vnd.flatpak.ref` | `flatpak install --system` |
 | `.flatpak` | `application/vnd.flatpak` | `flatpak install --system` |
 
@@ -141,6 +143,7 @@ The manager is a GTK4/Libadwaita app (with a Zenity fallback if GTK bindings are
 
 - apps exported from your distroboxes (RPM/DEB packages),
 - AppImages in `~/AppImages/`,
+- tarball installs in `~/.local/opt/`,
 - Flatpaks installed on the system.
 
 The list shows each app's icon (or a generic gear icon when no icon is found), name, version, type, container, and size. Features:
@@ -148,10 +151,10 @@ The list shows each app's icon (or a generic gear icon when no icon is found), n
 - **Side panel** — selecting one app shows its icon, version, type, container, size, locations, and **Launch / Update / Remove** quick actions without opening another window.
 - **Bulk actions** — Ctrl/Shift-click or use **Select all**, then update or remove the selected apps from the side panel.
 - **Sorting** — sort by name, version, package type, container, or size, with an ascending/descending toggle.
-- **Drag and drop** — drag RPM/DEB/AppImage/Flatpak files onto the manager; a highlighted “Drop packages to install” overlay appears, and the normal install review/progress runs.
+- **Drag and drop** — drag RPM/DEB/AppImage/tar.gz/Flatpak files onto the manager; a highlighted “Drop packages to install” overlay appears, and the normal install review/progress runs.
 - **Refresh/search** — refresh discovery or filter the list by name/type/container.
 
-For AppImages, **Update** opens a file picker for the replacement AppImage. The same operations are available non-interactively for CI:
+For AppImages and tarballs, **Update** opens a file picker for the replacement package. The same operations are available non-interactively for CI:
 
 ```bash
 boxinstall list                     # human-readable table
@@ -161,10 +164,11 @@ boxinstall show rpm:fedora:google-chrome-stable
 boxinstall update --all
 boxinstall update flatpak:org.gnome.Calculator
 boxinstall remove -y appimage:example
+boxinstall remove -y tarball:example
 boxinstall launch rpm:fedora:google-chrome-stable
 ```
 
-IDs have the form `rpm:CONTAINER:PACKAGE`, `deb:CONTAINER:PACKAGE`, `flatpak:APP_ID`, `appimage:SLUG`, or `export:CONTAINER:DESKTOP`. `list` prints them, and `show`/`update`/`remove`/`launch` accept either an ID or an app name.
+IDs have the form `rpm:CONTAINER:PACKAGE`, `deb:CONTAINER:PACKAGE`, `flatpak:APP_ID`, `appimage:SLUG`, `tarball:SLUG`, or `export:CONTAINER:DESKTOP`. `list` prints them, and `show`/`update`/`remove`/`launch` accept either an ID or an app name.
 
 `remove` requires `-y` in non-interactive runs. Updates and removals use the same waiting queue as installs, so a manager action will wait for an active install to finish rather than race it.
 
@@ -219,6 +223,7 @@ Container creation is automatic and only happens once per format. `dnf`/`apt` st
 BOXINSTALL_RPM_IMAGE=registry.fedoraproject.org/fedora-toolbox:latest
 BOXINSTALL_DEB_IMAGE=docker.io/library/ubuntu:24.04
 BOXINSTALL_APPIMAGE_DIR=$HOME/AppImages
+BOXINSTALL_TARBALL_DIR=$HOME/.local/opt
 BOXINSTALL_BOX=my-container
 BOXINSTALL_REINSTALL=1
 BOXINSTALL_LOCK_TIMEOUT=600
@@ -231,6 +236,7 @@ BOXINSTALL_NO_GUI=1
 - **RPM/DEB:** `boxinstall` asks the package manager which `.desktop` files the package provides, then runs `distrobox-export --app …` for each one. The exported launcher goes into `~/.local/share/applications/` and is copied to `~/Desktop/`.
 - **Flatpak:** the desktop file exported by Flatpak is copied to `~/Desktop/`.
 - **AppImage:** `boxinstall` creates a launcher in `~/.local/share/applications/`, extracts the embedded `.DirIcon` when available, and copies the launcher to `~/Desktop/`. AppImages live in `~/AppImages/` and use the existing `~/AppImages/.icons/` convention.
+- **Tarball:** the archive is extracted under `~/.local/opt/<name>`; `boxinstall` finds the executable and an icon, writes a launcher with `X-Boxinstall-Tarball`, and copies it to `~/Desktop/`.
 
 Desktop copies are made executable and tagged `metadata::trusted=true`, so GNOME/DING can launch them without an “Untrusted application launcher” prompt.
 
@@ -239,6 +245,18 @@ The application-menu entries are always created. Desktop shortcuts are skipped w
 ## AppImages
 
 AppImages are self-contained, so they are **not** run inside a distrobox. They are copied to `~/AppImages/<name>.appimage` and launched directly. This matches the common `~/AppImages` layout.
+
+## Tarballs
+
+`.tar.gz`, `.tgz`, `.tar.xz`, `.txz`, `.tar.zst`, `.tzst`, `.tar.bz2`, `.tbz2`, and plain `.tar` archives are supported. They are extracted to `~/.local/opt/<name>` (override with `BOXINSTALL_TARBALL_DIR`).
+
+`boxinstall` determines the executable from an embedded `.desktop`, Electron `product.json` metadata, or a runnable ELF binary in the archive; finds an icon; and creates a trusted launcher. Archives with no runnable executable are rejected. Reinstalling the same name asks **Reinstall/Replace**, and updates require selecting the new archive file.
+
+Example:
+
+```bash
+boxinstall /var/mnt/f/Downloads/Devin-linux-x64-3.12.17.tar.gz
+```
 
 ## Flatpak
 
@@ -325,6 +343,7 @@ This makes every commit include `Co-authored-by: OpenCode <noreply@opencode.ai>`
 | `~/.local/state/boxinstall/previous-mime-defaults` | restored by `uninstall.sh` |
 | `~/.local/share/gnome-shell/extensions/ding@rastersoft.com` | Desktop Icons NG |
 | `~/AppImages/` | AppImage installs |
+| `~/.local/opt/` | tarball installs (one directory per app) |
 | `~/.local/share/applications/<name>.desktop` | exported launchers |
 
 ## Troubleshooting

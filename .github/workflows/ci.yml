@@ -46,3 +46,12 @@ jobs:
           assert isinstance(apps, list)
           print(f"Discovered {len(apps)} app(s)")
           PY
+
+      - name: Tarball detection smoke test
+        run: |
+          mkdir -p /tmp/tarball-test/App
+          printf '#!/bin/sh\nexit 0\n' > /tmp/tarball-test/App/app
+          chmod +x /tmp/tarball-test/App/app
+          tar -czf /tmp/boxinstall-test.tar.gz -C /tmp/tarball-test App
+          ./boxinstall --dry-run --no-gui /tmp/boxinstall-test.tar.gz | tee /tmp/tarball.log
+          grep -q 'tar archive' /tmp/tarball.log
