@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION="$(sed -nE 's/^VERSION="([^"]+)"/\1/p' boxinstall | head -n1)"
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not find VERSION in boxinstall"
+            exit 1
+          fi
+          case "$VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "::error::VERSION '$VERSION' is not a valid release version"
+              exit 1
+              ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected version $VERSION (tag v$VERSION)"
+
+      - name: Check existing release
+        id: check
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists; nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build release archives
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PREFIX="boxinstall-$VERSION"
+          mkdir -p dist
+          git archive --format=tar.gz --prefix="$PREFIX/" -o "dist/$PREFIX.tar.gz" HEAD
+          git archive --format=zip --prefix="$PREFIX/" -o "dist/$PREFIX.zip" HEAD
+          ls -lh dist
+
+      - name: Create GitHub release
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          PREFIX="boxinstall-${{ steps.version.outputs.version }}"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "boxinstall $TAG" \
+              --generate-notes \
+              --latest
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$TARGET_SHA" \
+              --title "boxinstall $TAG" \
+              --generate-notes \
+              --latest
+          fi
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Summary
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          PREFIX="boxinstall-${{ steps.version.outputs.version }}"
+          echo "### Released $TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`$PREFIX.tar.gz\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`$PREFIX.zip\`" >> "$GITHUB_STEP_SUMMARY"

@@ -47,7 +47,11 @@ BOX_OVERRIDE="${BOXINSTALL_BOX:-}"
 NO_DESKTOP="${BOXINSTALL_NO_DESKTOP:-0}"
 NO_GUI="${BOXINSTALL_NO_GUI:-0}"
 REINSTALL="${BOXINSTALL_REINSTALL:-0}"
+AUTO_YES="${BOXINSTALL_YES:-0}"
 WAIT_TIMEOUT="${BOXINSTALL_LOCK_TIMEOUT:-3600}"
+if [ "$AUTO_YES" = "1" ]; then
+	REINSTALL=1
+fi
 PICK=0
 DRY_RUN=0
 VERBOSE=0
@@ -101,8 +105,8 @@ Options:
       --no-gui        never use graphical dialogs
       --no-desktop    create app-menu entries, but no desktop shortcuts
       --box NAME      use this distrobox (created if it does not exist)
-      --reinstall     reinstall/upgrade without asking when already installed
-  -y, --yes           same as --reinstall
+      --reinstall     allow reinstall/upgrade of an already-installed app
+  -y, --yes           fully non-interactive: skip review and duplicate prompts
       --wait SECONDS  queue behind another running boxinstall (default 3600)
       --no-wait       fail immediately if another boxinstall is running
       --dry-run       show what would happen without changing anything
@@ -114,6 +118,7 @@ Environment:
   BOXINSTALL_DEB_IMAGE         image for the DEB container
   BOXINSTALL_APPIMAGE_DIR      AppImage install directory (default ~/AppImages)
   BOXINSTALL_REINSTALL=1       same as --reinstall
+  BOXINSTALL_YES=1             same as --yes (fully non-interactive)
   BOXINSTALL_LOCK_TIMEOUT      seconds to wait for another instance (default 3600)
   BOXINSTALL_NO_DESKTOP=1      same as --no-desktop
   BOXINSTALL_NO_GUI=1          same as --no-gui
@@ -268,57 +273,94 @@ deb_version_relation() {
 	fi
 }
 
-# confirm_duplicate APP INSTALLED_VERSION PACKAGE_VERSION RELATION
-# Returns 0 to proceed, 1 to skip. Sets DUPLICATE_RELATION for the caller.
-confirm_duplicate() {
-	local app=$1 old=$2 new=$3 relation=$4
-	local action reason text answer
-	DUPLICATE_RELATION="$relation"
-
-	case "$relation" in
-	same) action="Reinstall" reason="The same version is already installed." ;;
-	newer) action="Upgrade" reason="The package is newer than the installed version." ;;
-	older) action="Downgrade" reason="The package is older than the installed version." ;;
-	different) action="Replace" reason="A different version is already installed." ;;
-	installed) action="Reinstall / update" reason="This application is already installed." ;;
-	*) action="Continue" reason="" ;;
+duplicate_action() {
+	case "$1" in
+	same) printf 'Reinstall' ;;
+	newer) printf 'Upgrade' ;;
+	older) printf 'Downgrade' ;;
+	different) printf 'Replace' ;;
+	installed) printf 'Reinstall / update' ;;
+	*) printf 'Install' ;;
 	esac
+}
 
-	text="$app is already installed."
-	[ -n "$old" ] && text+=$'\n\n'"Installed: $old"
-	[ -n "$new" ] && text+=$'\n'"Package:   $new"
-	[ -n "$reason" ] && text+=$'\n\n'"$reason"
-	text+=$'\n\n'"$action?"
+duplicate_reason() {
+	case "$1" in
+	same) printf 'The same version is already installed.' ;;
+	newer) printf 'The package is newer than the installed version.' ;;
+	older) printf 'The package is older than the installed version.' ;;
+	different) printf 'A different version is already installed.' ;;
+	installed) printf 'This application is already installed.' ;;
+	*) printf '' ;;
+	esac
+}
+
+# show_install_review APP ACTION TEXT DEPS_FILE IS_DUPLICATE
+# Shows the parsed package details and asks for confirmation.
+# Returns 0 to proceed, 1 to skip.
+show_install_review() {
+	local app=$1 action=$2 text=$3 deps_file=$4 is_duplicate=$5
+	local out="" rc=0 answer=""
 
 	if [ "$DRY_RUN" -eq 1 ]; then
-		say "Already installed: $app (installed: ${old:-?}, package: ${new:-?}); would ask: $action"
+		say "Would install $app ($action)"
 		return 0
 	fi
-	if [ "$REINSTALL" -eq 1 ]; then
-		log "REINSTALL: $app ($relation)"
+
+	if [ "$AUTO_YES" -eq 1 ]; then
+		if [ "$MODE" != "gui-child" ]; then
+			printf '\n%s\n\n' "$text" >&2
+		fi
+		log "AUTO YES: $app ($action)"
 		return 0
 	fi
 
 	if [ "$MODE" = "gui-child" ] && command -v zenity >/dev/null 2>&1; then
-		if zenity --question --no-markup --title="Already installed" \
-			--text="$text" --ok-label="$action" --cancel-label="Close" --width=580; then
-			return 0
-		fi
-		skip_add "$app (already installed)"
-		return 1
+		while :; do
+			out=""
+			rc=0
+			out=$(zenity --question --no-markup --title="Install $app" \
+				--text="$text" --ok-label="$action" --cancel-label="Cancel" \
+				--extra-button="Dependencies" --width=640 2>>"$LOG_FILE") || rc=$?
+
+			if [ "$out" = "Dependencies" ]; then
+				if [ -s "$deps_file" ]; then
+					zenity --text-info --title="Dependencies for $app" \
+						--filename="$deps_file" --width=820 --height=560 \
+						--ok-label="Back" 2>>"$LOG_FILE" || true
+				else
+					zenity --info --no-markup --title="Dependencies for $app" \
+						--text="No dependency information is available for this package." \
+						--width=480 2>>"$LOG_FILE" || true
+				fi
+				continue
+			fi
+
+			if [ "$rc" -eq 0 ]; then
+				return 0
+			fi
+			skip_add "$app (cancelled)"
+			return 1
+		done
 	fi
 
 	printf '\n%s\n\n' "$text" >&2
+	if [ "$is_duplicate" -eq 1 ] && [ "$REINSTALL" -eq 0 ] && [ ! -t 0 ]; then
+		warn "skipped $app (already installed; use -y/--yes or --reinstall)"
+		skip_add "$app (already installed)"
+		return 1
+	fi
 	if [ -t 0 ]; then
-		printf '%s? [y/N] ' "$action" >&2
+		printf '%s? [Y/n] ' "$action" >&2
 		read -r answer || answer=""
 		case "$answer" in
-		y | Y | yes | YES) return 0 ;;
+		n | N | no | NO)
+			skip_add "$app (cancelled)"
+			return 1
+			;;
 		esac
 	fi
-	warn "skipped $app (already installed; use --reinstall to override)"
-	skip_add "$app (already installed)"
-	return 1
+	return 0
 }
 
 acquire_lock() {
@@ -389,6 +431,7 @@ launch_gui() {
 	[ "$DRY_RUN" -eq 1 ] && child_args+=(--dry-run)
 	[ "$VERBOSE" -eq 1 ] && child_args+=(--verbose)
 	[ "$REINSTALL" -eq 1 ] && child_args+=(--reinstall)
+	[ "$AUTO_YES" -eq 1 ] && child_args+=(--yes)
 	[ -n "$BOX_OVERRIDE" ] && child_args+=(--box "$BOX_OVERRIDE")
 
 	if [ "$PICK" -eq 1 ] || [ ${#FILES[@]} -eq 0 ]; then
@@ -680,7 +723,7 @@ export_desktop_entries() {
 # ---------------------------------------------------------------------------
 install_rpm() {
 	local src=$1 box staged pkgname arch before after tmp candidates
-	local installed newver relation dnf_action
+	local installed="" newver="" relation="" dnf_action=""
 	require_cmd distrobox
 	require_cmd rpm
 	require_cmd podman
@@ -705,6 +748,32 @@ install_rpm() {
 	pkgname=$(rpm -qp --qf '%{NAME}' "$staged" 2>/dev/null | head -n1 || true)
 	newver=$(rpm -qp --qf '%{EPOCH}:%{VERSION}-%{RELEASE}' "$staged" 2>/dev/null | head -n1 || true)
 
+	local rname rversion rarch rsize rsummary filesize rsize_h text deps_dir deps_file
+	local action reason is_dup=0
+	rname=$(rpm -qp --qf '%{NAME}' "$staged" 2>/dev/null | head -n1 || true)
+	rversion=$(rpm -qp --qf '%{EPOCH}:%{VERSION}-%{RELEASE}' "$staged" 2>/dev/null | head -n1 || true)
+	rversion="${rversion#(none):}"
+	rarch=$(rpm -qp --qf '%{ARCH}' "$staged" 2>/dev/null | head -n1 || true)
+	rsize=$(rpm -qp --qf '%{SIZE}' "$staged" 2>/dev/null | head -n1 || true)
+	rsummary=$(rpm -qp --qf '%{SUMMARY}' "$staged" 2>/dev/null | head -n1 || true)
+	filesize=$(stat -c %s "$staged" 2>/dev/null || echo 0)
+	rsize_h="unknown"
+	if [ -n "$rsize" ] && [ "$rsize" != "0" ]; then
+		rsize_h=$(human_size "$rsize")
+	fi
+	rname="${rname:-${pkgname:-$(basename "$src")}}"
+	rversion="${rversion:-${newver#(none):}}"
+
+	deps_dir=$(mktemp -d "$CACHE_DIR/review.XXXXXX")
+	TMP_DIRS+=("$deps_dir")
+	deps_file="$deps_dir/deps.txt"
+	{
+		printf '%s %s\n\n' "$rname" "$rversion"
+		printf 'Declared RPM requirements:\n\n'
+		rpm -qpR "$staged" 2>/dev/null | grep -v '^rpmlib(' | sort -u || true
+		printf '\nNote: dnf resolves versions and downloads any missing dependencies at install time.\n'
+	} >"$deps_file"
+
 	installed=""
 	if [ -n "$pkgname" ]; then
 		if installed=$(distrobox enter "$box" -- rpm -q --qf '%{EPOCH}:%{VERSION}-%{RELEASE}' "$pkgname" 2>/dev/null </dev/null); then
@@ -715,9 +784,32 @@ install_rpm() {
 	fi
 	if [ -n "$installed" ]; then
 		relation=$(rpm_version_relation "$installed" "$newver")
-		if ! confirm_duplicate "${pkgname:-$(basename "$src")}" "${installed#(none):}" "${newver#(none):}" "$relation"; then
-			return 0
+	fi
+
+	action="Install"
+	reason=""
+	if [ -n "$relation" ]; then
+		action=$(duplicate_action "$relation")
+		reason=$(duplicate_reason "$relation")
+		is_dup=1
+	fi
+	DUPLICATE_RELATION="$relation"
+
+	text=$(printf '%s (%s)\n\nVersion:       %s\nArchitecture:  %s\nContainer:     %s\nFile:          %s\nDownload:      %s\nInstalled:     %s (package only)\n' \
+		"$rname" "RPM" "$rversion" "$rarch" "$box" "$(basename "$src")" "$(human_size "$filesize")" "$rsize_h")
+	if [ -n "$rsummary" ]; then
+		text+=$'\n\n'"$rsummary"
+	fi
+	if [ -n "$relation" ]; then
+		text+=$'\n\n'"Already installed: ${installed#(none):}"
+		if [ -n "$reason" ]; then
+			text+=$'\n'"$reason"
 		fi
+	fi
+	text+=$'\n\n'"$action?"
+
+	if ! show_install_review "$rname" "$action" "$text" "$deps_file" "$is_dup"; then
+		return 0
 	fi
 
 	dnf_action="install"
@@ -782,7 +874,7 @@ apt_update_if_needed() {
 
 install_deb() {
 	local src=$1 box staged pkgname before after tmp candidates
-	local installed newver relation
+	local installed="" newver="" relation=""
 	require_cmd distrobox
 	require_cmd podman
 	DUPLICATE_RELATION=""
@@ -801,6 +893,30 @@ install_deb() {
 	pkgname=$(distrobox enter "$box" -- dpkg-deb -f "$staged" Package 2>/dev/null | head -n1 || true)
 	newver=$(distrobox enter "$box" -- dpkg-deb -f "$staged" Version 2>/dev/null | head -n1 || true)
 
+	local darch dsize_kb ddepends dpredepends drecommends filesize dsize_h
+	local text deps_dir deps_file action reason is_dup=0
+	darch=$(distrobox enter "$box" -- dpkg-deb -f "$staged" Architecture 2>/dev/null | head -n1 || true)
+	dsize_kb=$(distrobox enter "$box" -- dpkg-deb -f "$staged" Installed-Size 2>/dev/null | head -n1 || true)
+	ddepends=$(distrobox enter "$box" -- dpkg-deb -f "$staged" Depends 2>/dev/null | head -n1 || true)
+	dpredepends=$(distrobox enter "$box" -- dpkg-deb -f "$staged" Pre-Depends 2>/dev/null | head -n1 || true)
+	drecommends=$(distrobox enter "$box" -- dpkg-deb -f "$staged" Recommends 2>/dev/null | head -n1 || true)
+	filesize=$(stat -c %s "$staged" 2>/dev/null || echo 0)
+	dsize_h="unknown"
+	if [ -n "$dsize_kb" ] && [ "$dsize_kb" -gt 0 ] 2>/dev/null; then
+		dsize_h=$(human_size $((dsize_kb * 1024)))
+	fi
+
+	deps_dir=$(mktemp -d "$CACHE_DIR/review.XXXXXX")
+	TMP_DIRS+=("$deps_dir")
+	deps_file="$deps_dir/deps.txt"
+	{
+		printf '%s %s\n\n' "${pkgname:-$(basename "$src")}" "${newver:-?}"
+		printf 'Depends:\n%s\n\n' "${ddepends:-none}"
+		printf 'Pre-Depends:\n%s\n\n' "${dpredepends:-none}"
+		printf 'Recommends:\n%s\n\n' "${drecommends:-none}"
+		printf 'Note: apt resolves versions and downloads any missing dependencies at install time.\n'
+	} >"$deps_file"
+
 	installed=""
 	if [ -n "$pkgname" ]; then
 		if installed=$(distrobox enter "$box" -- dpkg-query -W -f="\${Version}" "$pkgname" 2>/dev/null </dev/null); then
@@ -811,9 +927,29 @@ install_deb() {
 	fi
 	if [ -n "$installed" ]; then
 		relation=$(deb_version_relation "$box" "$installed" "$newver")
-		if ! confirm_duplicate "${pkgname:-$(basename "$src")}" "$installed" "$newver" "$relation"; then
-			return 0
+	fi
+
+	action="Install"
+	reason=""
+	if [ -n "$relation" ]; then
+		action=$(duplicate_action "$relation")
+		reason=$(duplicate_reason "$relation")
+		is_dup=1
+	fi
+	DUPLICATE_RELATION="$relation"
+
+	text=$(printf '%s (%s)\n\nVersion:       %s\nArchitecture:  %s\nContainer:     %s\nFile:          %s\nDownload:      %s\nInstalled:     %s (package only)\n' \
+		"${pkgname:-$(basename "$src")}" "DEB" "${newver:-?}" "${darch:-unknown}" "$box" "$(basename "$src")" "$(human_size "$filesize")" "$dsize_h")
+	if [ -n "$relation" ]; then
+		text+=$'\n\n'"Already installed: $installed"
+		if [ -n "$reason" ]; then
+			text+=$'\n'"$reason"
 		fi
+	fi
+	text+=$'\n\n'"$action?"
+
+	if ! show_install_review "${pkgname:-$(basename "$src")}" "$action" "$text" "$deps_file" "$is_dup"; then
+		return 0
 	fi
 
 	tmp=$(mktemp -d "$CACHE_DIR/deb.XXXXXX")
@@ -868,7 +1004,8 @@ install_appimage() {
 	local src=$1 base name slug destdir dest tmp dfile="" d_name="" d_comment=""
 	local d_categories="" d_mime="" d_wmclass="" d_version="" icon_ref="application-x-executable"
 	local icon_dest="" di="" target="" icon_name="" desktop exec_path
-	local old_sha="" new_sha="" relation="" old_desc="" new_desc=""
+	local old_sha="" new_sha="" relation="" old_desc=""
+	local filesize arch text deps_dir deps_file action reason is_dup=0
 	DUPLICATE_RELATION=""
 
 	base=$(basename -- "$src")
@@ -885,6 +1022,9 @@ install_appimage() {
 		return 0
 	fi
 
+	filesize=$(stat -c %s "$src" 2>/dev/null || echo 0)
+	arch=$(file -b "$src" 2>/dev/null | cut -d, -f2 | sed 's/^ *//' || true)
+
 	if [ -e "$dest" ]; then
 		old_sha=$(sha256sum "$dest" 2>/dev/null | cut -d' ' -f1 || true)
 		new_sha=$(sha256sum "$src" 2>/dev/null | cut -d' ' -f1 || true)
@@ -894,10 +1034,38 @@ install_appimage() {
 			relation="different"
 		fi
 		old_desc="$(basename "$dest") ($(human_size "$(stat -c %s "$dest" 2>/dev/null || echo 0)"), $(date -r "$dest" '+%Y-%m-%d %H:%M' 2>/dev/null || true))"
-		new_desc="$(basename "$src") ($(human_size "$(stat -c %s "$src" 2>/dev/null || echo 0)"), $(date -r "$src" '+%Y-%m-%d %H:%M' 2>/dev/null || true))"
-		if ! confirm_duplicate "$name" "$old_desc" "$new_desc" "$relation"; then
-			return 0
+	fi
+
+	action="Install"
+	reason=""
+	if [ -n "$relation" ]; then
+		action=$(duplicate_action "$relation")
+		reason=$(duplicate_reason "$relation")
+		is_dup=1
+	fi
+	DUPLICATE_RELATION="$relation"
+
+	deps_dir=$(mktemp -d "$CACHE_DIR/review.XXXXXX")
+	TMP_DIRS+=("$deps_dir")
+	deps_file="$deps_dir/deps.txt"
+	{
+		printf '%s (AppImage)\n\n' "$name"
+		printf 'AppImages bundle their own libraries and dependencies.\n'
+		printf 'The host needs FUSE (included on Bazzite) and basic graphics support.\n'
+	} >"$deps_file"
+
+	text=$(printf '%s (%s)\n\nType:          self-contained AppImage\nArchitecture:  %s\nFile:          %s\nDownload:      %s\nInstall to:    %s\n' \
+		"$name" "AppImage" "${arch:-unknown}" "$(basename "$src")" "$(human_size "$filesize")" "$dest")
+	if [ -n "$relation" ]; then
+		text+=$'\n'"Already installed: $old_desc"
+		if [ -n "$reason" ]; then
+			text+=$'\n'"$reason"
 		fi
+	fi
+	text+=$'\n\n'"$action?"
+
+	if ! show_install_review "$name" "$action" "$text" "$deps_file" "$is_dup"; then
+		return 0
 	fi
 
 	mkdir -p "$destdir" "$destdir/.icons"
@@ -1018,7 +1186,9 @@ find_flatpak_desktop() {
 
 install_flatpak() {
 	local src=$1 kind=$2 tmp before after new_ids id dfile name hint="" count=0
-	local installed_ver="" relation=""
+	local installed_ver="" relation="" ftitle="" fbranch="" fremote="" fruntime=""
+	local installed_size="" fruntime_info=""
+	local filesize text deps_file action reason is_dup=0
 	require_cmd flatpak
 	require_cmd sudo
 	DUPLICATE_RELATION=""
@@ -1030,22 +1200,75 @@ install_flatpak() {
 
 	if [ "$kind" = "flatpakref" ]; then
 		hint=$(sed -n 's/^Name=//p' "$src" | head -n1 || true)
+		ftitle=$(sed -n 's/^Title=//p' "$src" | head -n1 || true)
+		fbranch=$(sed -n 's/^Branch=//p' "$src" | head -n1 || true)
+		fremote=$(sed -n 's/^SuggestRemoteName=//p' "$src" | head -n1 || true)
+		fruntime=$(sed -n 's/^RuntimeRepo=//p' "$src" | head -n1 || true)
 	fi
+	ftitle="${ftitle:-${hint:-$(basename "$src")}}"
+	[ -n "$fbranch" ] || fbranch="unknown"
+	[ -n "$fremote" ] || fremote="unknown"
+	filesize=$(stat -c %s "$src" 2>/dev/null || echo 0)
 
 	if [ "$DRY_RUN" -eq 1 ]; then
 		say "Would install $(basename "$src") with flatpak (system scope)"
 		return 0
 	fi
 
-	flatpak list --app --columns=application 2>>"$LOG_FILE" | sort -u >"$before"
-
 	if [ -n "$hint" ] && flatpak list --app --columns=application 2>/dev/null | grep -qx "$hint"; then
 		installed_ver=$(flatpak info "$hint" 2>/dev/null | awk -F': ' '/^ *Version:/{print $2; exit}' || true)
-		if ! confirm_duplicate "$hint" "$installed_ver" "(latest from repository)" "installed"; then
-			return 0
+		installed_size=$(flatpak info "$hint" 2>/dev/null | awk -F': ' '/Installed Size:/{print $2; exit}' || true)
+		fruntime_info=$(flatpak info "$hint" 2>/dev/null | awk -F': ' '/Runtime:/{print $2; exit}' || true)
+		relation="installed"
+		action=$(duplicate_action "$relation")
+		reason=$(duplicate_reason "$relation")
+		is_dup=1
+	else
+		action="Install"
+		reason=""
+	fi
+	DUPLICATE_RELATION="$relation"
+
+	deps_file="$tmp/deps.txt"
+	{
+		printf '%s (Flatpak)\n\n' "$ftitle"
+		printf 'App ID:        %s\n' "${hint:-from bundle}"
+		printf 'Branch:        %s\n' "$fbranch"
+		printf 'Remote:        %s\n' "$fremote"
+		printf 'Runtime:       %s\n\n' "${fruntime_info:-${fruntime:-managed by Flatpak}}"
+		printf 'Flatpak installs the required runtime and its dependencies automatically.\n'
+	} >"$deps_file"
+
+	if [ -n "$hint" ]; then
+		local installed_desc="managed by Flatpak"
+		if [ -n "$installed_ver" ]; then
+			installed_desc="$installed_ver"
+			if [ -n "$installed_size" ]; then
+				installed_desc+=" ($installed_size)"
+			fi
 		fi
+		text=$(printf '%s (%s)\n\nApp ID:        %s\nBranch:        %s\nRemote:        %s\nRef file:      %s\nDownload:      managed by Flatpak\nInstalled:     %s\n' \
+			"$ftitle" "Flatpak" "$hint" "$fbranch" "$fremote" "$(basename "$src")" "$installed_desc")
+	else
+		text=$(printf '%s (%s)\n\nApp ID:        read from the bundle during install\nFile:          %s\nDownload:      %s\nInstalled:     managed by Flatpak\n' \
+			"$ftitle" "Flatpak bundle" "$(basename "$src")" "$(human_size "$filesize")")
+	fi
+	if [ -n "$relation" ]; then
+		text+=$'\n\n'"Already installed: ${installed_ver:-unknown}"
+		if [ -n "$reason" ]; then
+			text+=$'\n'"$reason"
+		fi
+	fi
+	text+=$'\n\n'"$action?"
+
+	if ! show_install_review "$ftitle" "$action" "$text" "$deps_file" "$is_dup"; then
+		return 0
+	fi
+	if [ -n "$relation" ]; then
 		say "Updating/reinstalling Flatpak: $hint"
 	fi
+
+	flatpak list --app --columns=application 2>>"$LOG_FILE" | sort -u >"$before"
 
 	say "Installing Flatpak: $(basename "$src")"
 	local flatpak_ok=0 install_out="$tmp/flatpak.out" user_out="$tmp/flatpak-user.out"
@@ -1199,8 +1422,12 @@ main() {
 		--no-desktop)
 			NO_DESKTOP=1
 			;;
-		--reinstall | -y | --yes)
+		--reinstall)
 			REINSTALL=1
+			;;
+		-y | --yes)
+			REINSTALL=1
+			AUTO_YES=1
 			;;
 		--no-wait)
 			WAIT_TIMEOUT=0

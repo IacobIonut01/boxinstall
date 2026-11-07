@@ -1,14 +1,18 @@
 # boxinstall
 
+[![CI](https://github.com/IacobIonut01/boxinstall/actions/workflows/ci.yml/badge.svg)](https://github.com/IacobIonut01/boxinstall/actions/workflows/ci.yml)
+[![Release](https://github.com/IacobIonut01/boxinstall/actions/workflows/release.yml/badge.svg)](https://github.com/IacobIonut01/boxinstall/actions/workflows/release.yml)
+
 A one-click installer for Linux packages on **Bazzite / Fedora Atomic (Silverblue, Kinoite, …)**.
 
 Double-click an `.rpm`, `.deb`, `.AppImage`, `.flatpakref`, or `.flatpak` file and it:
 
-1. picks the right installation method,
-2. reuses or creates the needed distrobox,
-3. installs the app with `dnf`, `apt`, `flatpak`, or natively for AppImages,
-4. exports the app to the GNOME application menu,
-5. places a trusted launcher on your GNOME desktop.
+1. shows a review with package details, estimated size, and a Dependencies window,
+2. picks the right installation method,
+3. reuses or creates the needed distrobox,
+4. installs the app with `dnf`, `apt`, `flatpak`, or natively for AppImages,
+5. exports the app to the GNOME application menu,
+6. places a trusted launcher on your GNOME desktop.
 
 The same thing works from a terminal:
 
@@ -62,13 +66,28 @@ boxinstall --no-gui FILE          # never show dialogs
 boxinstall --dry-run --no-gui FILE
 boxinstall --no-desktop FILE      # app-menu entry only, no desktop shortcut
 boxinstall --box my-container FILE
-boxinstall --reinstall FILE       # skip the "already installed" prompt
+boxinstall -y FILE                # skip details/duplicate prompts (CI)
+boxinstall --reinstall FILE       # allow duplicate installs without the duplicate prompt
 boxinstall --wait 600 FILE        # queue for up to 10 minutes
 boxinstall --no-wait FILE         # fail immediately if another run is active
 boxinstall --help
 ```
 
 `boxinstall` is installed in `~/.local/bin`, which is already on your `PATH` on Bazzite.
+
+## Package details before install
+
+In graphical mode, opening a package first shows a review dialog:
+
+- package name, version, architecture, and type;
+- target distrobox;
+- package download size and declared installed size;
+- the package summary;
+- **Install**, **Cancel**, and **Dependencies** buttons.
+
+**Dependencies** opens a scrollable window with the declared RPM requirements or the DEB `Depends` / `Pre-Depends` / `Recommends` fields. Flatpaks show the app ID, branch, remote, runtime, and installed size; AppImages explain that their libraries are bundled.
+
+In a terminal the same details are printed. A terminal prompt defaults to **yes**; non-interactive runs proceed unless the app is already installed and no `-y`/`--reinstall` was given.
 
 ## Already installed / duplicate detection
 
@@ -79,7 +98,7 @@ Before installing, `boxinstall` compares the package with what is already presen
 - **Flatpak:** the app ID is already installed in system or user scope.
 - **AppImage:** a file with the same name exists in `~/AppImages` (same SHA-256 = reinstall, different file = replace).
 
-If it finds an existing app, it shows a dialog with the installed and new versions and one action button:
+The installed version is included in the same review dialog and the action button changes:
 
 | Situation | Button |
 |---|---|
@@ -89,9 +108,24 @@ If it finds an existing app, it shows a dialog with the installed and new versio
 | Different/uncomparable versions | **Replace** |
 | Flatpak already installed | **Reinstall / update** |
 
-The other button is **Close**, which skips that file without changing anything. In a terminal it asks `[y/N]`; in non-interactive/CI runs it skips unless `--reinstall` / `-y` / `BOXINSTALL_REINSTALL=1` is used.
+The other button is **Cancel**, which skips that file without changing anything. In a terminal it asks `[Y/n]`; in non-interactive/CI runs it skips unless `-y/--yes`, `--reinstall`, or `BOXINSTALL_REINSTALL=1` is used.
 
 An accepted reinstall/upgrade/downgrade uses the correct package-manager operation (`dnf reinstall`/`upgrade`/`downgrade`, `apt-get --reinstall`/`--allow-downgrades`, `flatpak --or-update`, or copying the new AppImage).
+
+## CI / non-interactive
+
+```bash
+boxinstall -y --no-gui ~/Downloads/app.rpm
+BOXINSTALL_YES=1 boxinstall --no-gui --no-wait ~/Downloads/app.deb
+```
+
+`-y` / `--yes` / `BOXINSTALL_YES=1` means:
+
+- no details review dialog;
+- no duplicate prompt;
+- proceed with install/reinstall/upgrade automatically.
+
+Combine it with `--no-gui` in CI. The default lock behavior queues behind another run; use `--no-wait` for fail-fast jobs or `--wait SECONDS` / `BOXINSTALL_LOCK_TIMEOUT` to bound the wait.
 
 ## Concurrent installs / queue
 
@@ -164,6 +198,19 @@ Flatpak packages are installed system-wide with `flatpak install --system`. If t
 ## Snap and `.run`
 
 Snap does not work well on Fedora Atomic/Bazzite, and self-extracting `.run` installers are not safely containerizable. `boxinstall` rejects both with a message pointing to the Flatpak/AppImage/RPM/DEB alternative.
+
+## Releases
+
+`VERSION` in [`boxinstall`](boxinstall) is the source of truth.
+
+When a push to `main` passes CI, the **Release** workflow:
+
+1. reads `VERSION` (for example `1.0.0`),
+2. skips if release `v1.0.0` already exists,
+3. otherwise creates tag `v1.0.0` and a GitHub Release with generated notes,
+4. attaches `boxinstall-1.0.0.tar.gz` and `boxinstall-1.0.0.zip`.
+
+To publish a new version, bump `VERSION` in `boxinstall`, commit, and push to `main`. You can also run the workflow manually from **Actions → Release → Run workflow**.
 
 ## Logs
 
