@@ -1,0 +1,1313 @@
+#!/usr/bin/env bash
+# boxinstall - one-click installer for RPM/DEB/AppImage/Flatpak packages on
+# Bazzite and other Fedora Atomic desktops.
+#
+# It installs RPMs in a Fedora distrobox, DEBs in an Ubuntu/Debian distrobox,
+# runs Flatpak installs natively, and installs AppImages under ~/AppImages.
+# Every graphical app it finds is exported to the application menu and copied
+# to the GNOME desktop as a trusted launcher.
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version.
+
+set -Eeuo pipefail
+
+PROG="boxinstall"
+VERSION="1.0.0"
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "$0")"
+
+# ---------------------------------------------------------------------------
+# Paths and defaults
+# ---------------------------------------------------------------------------
+HOME_DIR="${HOME:?HOME is not set}"
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME_DIR/.local/share}"
+XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME_DIR/.local/state}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME_DIR/.cache}"
+
+APPS_DIR="$XDG_DATA_HOME/applications"
+ICONS_DIR="$XDG_DATA_HOME/icons"
+STATE_DIR="$XDG_STATE_HOME/boxinstall"
+CACHE_DIR="$XDG_CACHE_HOME/boxinstall"
+LOCK_DIR="$STATE_DIR/lock.d"
+LOG_FILE="$STATE_DIR/boxinstall.log"
+SUMMARY_FILE="${BOXINSTALL_SUMMARY_FILE:-$STATE_DIR/last-summary}"
+SKIPPED_FILE="${BOXINSTALL_SKIPPED_FILE:-$STATE_DIR/last-skipped}"
+APPIMAGE_DIR="${BOXINSTALL_APPIMAGE_DIR:-$HOME_DIR/AppImages}"
+
+DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
+if [ -z "$DESKTOP_DIR" ] || [ "$DESKTOP_DIR" = "$HOME_DIR" ]; then
+	DESKTOP_DIR="$HOME_DIR/Desktop"
+fi
+
+RPM_IMAGE="${BOXINSTALL_RPM_IMAGE:-registry.fedoraproject.org/fedora-toolbox:latest}"
+DEB_IMAGE="${BOXINSTALL_DEB_IMAGE:-docker.io/library/ubuntu:24.04}"
+BOX_OVERRIDE="${BOXINSTALL_BOX:-}"
+NO_DESKTOP="${BOXINSTALL_NO_DESKTOP:-0}"
+NO_GUI="${BOXINSTALL_NO_GUI:-0}"
+REINSTALL="${BOXINSTALL_REINSTALL:-0}"
+WAIT_TIMEOUT="${BOXINSTALL_LOCK_TIMEOUT:-3600}"
+PICK=0
+DRY_RUN=0
+VERBOSE=0
+
+MODE="cli"
+GUI_CHILD=0
+TMP_DIRS=()
+EXPORTED_COUNT=0
+LOCK_ACQUIRED=0
+STAGED_FILE=""
+DUPLICATE_RELATION=""
+RUN_DIR=""
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+if [ -t 1 ]; then
+	C_BOLD=$'\033[1m'
+	C_RED=$'\033[31m'
+	C_GREEN=$'\033[32m'
+	C_YELLOW=$'\033[33m'
+	C_RESET=$'\033[0m'
+else
+	C_BOLD=""
+	C_RED=""
+	C_GREEN=""
+	C_YELLOW=""
+	C_RESET=""
+fi
+
+usage() {
+	cat <<EOF
+${C_BOLD}$PROG $VERSION${C_RESET} - install Linux packages into a distrobox
+
+Usage:
+  $PROG [options] FILE...
+  $PROG [options] URL...
+  $PROG                 (graphical file picker, when launched from the desktop)
+
+Supported packages:
+  .rpm                    installed in a Fedora distrobox
+  .deb                    installed in an Ubuntu/Debian distrobox
+  .AppImage / .appimage   installed in ~/AppImages (no container needed)
+  .flatpakref / .flatpak  installed with the system Flatpak
+  http(s):// URLs         downloaded first, then handled as above
+
+Options:
+  -h, --help          show this help
+  -V, --version       show the version
+      --pick          open the graphical file picker
+      --no-gui        never use graphical dialogs
+      --no-desktop    create app-menu entries, but no desktop shortcuts
+      --box NAME      use this distrobox (created if it does not exist)
+      --reinstall     reinstall/upgrade without asking when already installed
+  -y, --yes           same as --reinstall
+      --wait SECONDS  queue behind another running boxinstall (default 3600)
+      --no-wait       fail immediately if another boxinstall is running
+      --dry-run       show what would happen without changing anything
+  -v, --verbose       more detail in the terminal
+
+Environment:
+  BOXINSTALL_BOX               default container name override
+  BOXINSTALL_RPM_IMAGE         image for the RPM container
+  BOXINSTALL_DEB_IMAGE         image for the DEB container
+  BOXINSTALL_APPIMAGE_DIR      AppImage install directory (default ~/AppImages)
+  BOXINSTALL_REINSTALL=1       same as --reinstall
+  BOXINSTALL_LOCK_TIMEOUT      seconds to wait for another instance (default 3600)
+  BOXINSTALL_NO_DESKTOP=1      same as --no-desktop
+  BOXINSTALL_NO_GUI=1          same as --no-gui
+  BOXINSTALL_GUI=1             force GUI mode (1) or terminal mode (0)
+
+Examples:
+  $PROG ~/Downloads/google-chrome-stable_current_x86_64.rpm
+  $PROG ~/Downloads/code_1.99_amd64.deb
+  $PROG ~/Downloads/Obsidian-1.8.10.AppImage
+  $PROG https://example.org/app.flatpakref
+EOF
+}
+
+die() {
+	printf '%s: %s\n' "$PROG" "$*" >&2
+	exit 1
+}
+
+error() {
+	printf '%s: %s\n' "$PROG" "$*" >&2
+	log "ERROR: $*"
+}
+
+warn() {
+	if [ "$MODE" = "gui-child" ]; then
+		printf '# Warning: %s\n' "$*" >&2
+	else
+		printf '%sWarning:%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2
+	fi
+	log "WARNING: $*"
+}
+
+say() {
+	if [ "$MODE" = "gui-child" ]; then
+		printf '# %s\n' "$*"
+	else
+		printf '%s==>%s %s\n' "$C_BOLD" "$C_RESET" "$*"
+	fi
+}
+
+log() {
+	[ "$LOG_FILE" = "/dev/null" ] && return 0
+	printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+require_cmd() {
+	command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+cleanup() {
+	local dir
+	for dir in ${TMP_DIRS[@]+"${TMP_DIRS[@]}"}; do
+		[ -n "$dir" ] && rm -rf -- "$dir" 2>/dev/null || true
+	done
+	if [ "$LOCK_ACQUIRED" -eq 1 ]; then
+		rm -rf -- "$LOCK_DIR" 2>/dev/null || true
+	fi
+	if [ -n "$RUN_DIR" ]; then
+		rm -rf -- "$RUN_DIR" 2>/dev/null || true
+	fi
+}
+trap cleanup EXIT
+
+run() {
+	log "RUN: $*"
+	if [ "$DRY_RUN" -eq 1 ]; then
+		return 0
+	fi
+	if [ "$MODE" = "gui-child" ]; then
+		"$@" >>"$LOG_FILE" 2>&1
+	else
+		"$@" 2>&1 | tee -a "$LOG_FILE"
+		return "${PIPESTATUS[0]}"
+	fi
+}
+
+run_capture() {
+	local out=$1 rc=0
+	shift
+	log "RUN: $*"
+	if [ "$DRY_RUN" -eq 1 ]; then
+		return 0
+	fi
+	if [ "$MODE" = "gui-child" ]; then
+		"$@" >"$out" 2>&1 || rc=$?
+		cat "$out" >>"$LOG_FILE" 2>/dev/null || true
+		return "$rc"
+	else
+		"$@" 2>&1 | tee "$out" | tee -a "$LOG_FILE"
+		return "${PIPESTATUS[0]}"
+	fi
+}
+
+refresh_desktop_db() {
+	if command -v update-desktop-database >/dev/null 2>&1; then
+		update-desktop-database "$APPS_DIR" >>"$LOG_FILE" 2>&1 || true
+	fi
+	if [ -d "$ICONS_DIR/hicolor" ] && command -v gtk-update-icon-cache >/dev/null 2>&1; then
+		gtk-update-icon-cache -f -t "$ICONS_DIR/hicolor" >>"$LOG_FILE" 2>&1 || true
+	fi
+}
+
+summary_add() {
+	[ "$DRY_RUN" -eq 1 ] && return 0
+	printf '%s\n' "$1" >>"$SUMMARY_FILE"
+	log "SUMMARY: $1"
+}
+
+skip_add() {
+	[ "$DRY_RUN" -eq 1 ] && return 0
+	printf '%s\n' "$1" >>"$SKIPPED_FILE"
+	log "SKIPPED: $1"
+}
+
+human_size() {
+	numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || printf '%s bytes' "$1"
+}
+
+rpm_version_relation() {
+	local old=$1 new=$2 cmp
+	old="${old#(none):}"
+	new="${new#(none):}"
+	[ -n "$old" ] && [ -n "$new" ] || {
+		printf 'different'
+		return 0
+	}
+	cmp=$(rpm --eval '%{lua: print(rpm.vercmp("'"$old"'", "'"$new"'"))}' 2>/dev/null || true)
+	case "$cmp" in
+	0 | 0.0) printf 'same' ;;
+	-1) printf 'newer' ;;
+	1) printf 'older' ;;
+	*) printf 'different' ;;
+	esac
+}
+
+deb_version_relation() {
+	local box=$1 old=$2 new=$3
+	[ -n "$old" ] && [ -n "$new" ] || {
+		printf 'different'
+		return 0
+	}
+	if distrobox enter "$box" -- dpkg --compare-versions "$old" eq "$new" 2>/dev/null; then
+		printf 'same'
+	elif distrobox enter "$box" -- dpkg --compare-versions "$old" lt "$new" 2>/dev/null; then
+		printf 'newer'
+	elif distrobox enter "$box" -- dpkg --compare-versions "$old" gt "$new" 2>/dev/null; then
+		printf 'older'
+	else
+		printf 'different'
+	fi
+}
+
+# confirm_duplicate APP INSTALLED_VERSION PACKAGE_VERSION RELATION
+# Returns 0 to proceed, 1 to skip. Sets DUPLICATE_RELATION for the caller.
+confirm_duplicate() {
+	local app=$1 old=$2 new=$3 relation=$4
+	local action reason text answer
+	DUPLICATE_RELATION="$relation"
+
+	case "$relation" in
+	same) action="Reinstall" reason="The same version is already installed." ;;
+	newer) action="Upgrade" reason="The package is newer than the installed version." ;;
+	older) action="Downgrade" reason="The package is older than the installed version." ;;
+	different) action="Replace" reason="A different version is already installed." ;;
+	installed) action="Reinstall / update" reason="This application is already installed." ;;
+	*) action="Continue" reason="" ;;
+	esac
+
+	text="$app is already installed."
+	[ -n "$old" ] && text+=$'\n\n'"Installed: $old"
+	[ -n "$new" ] && text+=$'\n'"Package:   $new"
+	[ -n "$reason" ] && text+=$'\n\n'"$reason"
+	text+=$'\n\n'"$action?"
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		say "Already installed: $app (installed: ${old:-?}, package: ${new:-?}); would ask: $action"
+		return 0
+	fi
+	if [ "$REINSTALL" -eq 1 ]; then
+		log "REINSTALL: $app ($relation)"
+		return 0
+	fi
+
+	if [ "$MODE" = "gui-child" ] && command -v zenity >/dev/null 2>&1; then
+		if zenity --question --no-markup --title="Already installed" \
+			--text="$text" --ok-label="$action" --cancel-label="Close" --width=580; then
+			return 0
+		fi
+		skip_add "$app (already installed)"
+		return 1
+	fi
+
+	printf '\n%s\n\n' "$text" >&2
+	if [ -t 0 ]; then
+		printf '%s? [y/N] ' "$action" >&2
+		read -r answer || answer=""
+		case "$answer" in
+		y | Y | yes | YES) return 0 ;;
+		esac
+	fi
+	warn "skipped $app (already installed; use --reinstall to override)"
+	skip_add "$app (already installed)"
+	return 1
+}
+
+acquire_lock() {
+	local pid start no_pid_since=0 announced=0
+	start=$SECONDS
+
+	while :; do
+		if mkdir "$LOCK_DIR" 2>/dev/null; then
+			printf '%s\n' "$$" >"$LOCK_DIR/pid"
+			LOCK_ACQUIRED=1
+			return 0
+		fi
+
+		pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+			no_pid_since=0
+			if [ "$WAIT_TIMEOUT" -eq 0 ]; then
+				die "another $PROG instance is already running (pid $pid); use --wait to queue"
+			fi
+			if [ "$announced" -eq 0 ]; then
+				say "Waiting for another $PROG instance (pid $pid) to finish..."
+				log "WAITING: pid $pid"
+				announced=1
+			fi
+			if [ $((SECONDS - start)) -ge "$WAIT_TIMEOUT" ]; then
+				die "timed out after ${WAIT_TIMEOUT}s waiting for $PROG pid $pid"
+			fi
+			sleep 1
+			continue
+		fi
+
+		# No pid yet (tiny creation window) or a stale lock from a killed process.
+		if [ -z "$pid" ]; then
+			if [ "$no_pid_since" -eq 0 ]; then
+				no_pid_since=$SECONDS
+			fi
+			if [ $((SECONDS - no_pid_since)) -lt 5 ]; then
+				sleep 1
+				continue
+			fi
+		fi
+		log "REMOVING STALE LOCK: ${pid:-no pid}"
+		rm -rf "$LOCK_DIR" 2>/dev/null || true
+		no_pid_since=0
+	done
+}
+
+# ---------------------------------------------------------------------------
+# GUI handling
+# ---------------------------------------------------------------------------
+gui_available() {
+	case "${BOXINSTALL_GUI:-}" in
+	1) return 0 ;;
+	0) return 1 ;;
+	esac
+	[ "$NO_GUI" -eq 1 ] && return 1
+	[ -t 0 ] && [ -t 1 ] && return 1
+	[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] || return 1
+	command -v zenity >/dev/null 2>&1 || return 1
+	return 0
+}
+
+launch_gui() {
+	local -a child_args=()
+	local rc=0 summary="" skipped="" text="" picked="" details=""
+
+	[ "$NO_DESKTOP" -eq 1 ] && child_args+=(--no-desktop)
+	[ "$DRY_RUN" -eq 1 ] && child_args+=(--dry-run)
+	[ "$VERBOSE" -eq 1 ] && child_args+=(--verbose)
+	[ "$REINSTALL" -eq 1 ] && child_args+=(--reinstall)
+	[ -n "$BOX_OVERRIDE" ] && child_args+=(--box "$BOX_OVERRIDE")
+
+	if [ "$PICK" -eq 1 ] || [ ${#FILES[@]} -eq 0 ]; then
+		if ! picked=$(zenity \
+			--file-selection \
+			--multiple \
+			--separator=$'\n' \
+			--title="Choose a package to install" \
+			--file-filter="Packages (*.rpm, *.deb, *.AppImage, *.flatpakref, *.flatpak) | *.rpm *.deb *.AppImage *.appimage *.flatpakref *.flatpak" \
+			--file-filter="All files | *" 2>>"$LOG_FILE"); then
+			return 0
+		fi
+		[ -n "$picked" ] || return 0
+		local -a picked_files=()
+		mapfile -t picked_files <<<"$picked"
+		child_args+=("${picked_files[@]}")
+	else
+		child_args+=("${FILES[@]}")
+	fi
+
+	RUN_DIR=$(mktemp -d "$STATE_DIR/run.XXXXXX") || die "could not create a run directory"
+	SUMMARY_FILE="$RUN_DIR/summary"
+	SKIPPED_FILE="$RUN_DIR/skipped"
+	: >"$SUMMARY_FILE" 2>/dev/null || true
+	: >"$SKIPPED_FILE" 2>/dev/null || true
+
+	local title="Installing Linux apps"
+	[ "$DRY_RUN" -eq 1 ] && title="Dry run - installing Linux apps"
+
+	set +e
+	BOXINSTALL_SUMMARY_FILE="$SUMMARY_FILE" \
+		BOXINSTALL_SKIPPED_FILE="$SKIPPED_FILE" \
+		BOXINSTALL_GUI_CHILD=1 "$SELF" "${child_args[@]}" </dev/null 2>&1 |
+		tee -a "$LOG_FILE" |
+		grep --line-buffered '^#' |
+		zenity --progress --pulsate --no-cancel --auto-close \
+			--title="$title" --text="Preparing..." --width=540
+	rc=${PIPESTATUS[0]}
+	set -e
+
+	summary=""
+	skipped=""
+	if [ -s "$SUMMARY_FILE" ]; then
+		summary=$(cat "$SUMMARY_FILE")
+	fi
+	if [ -s "$SKIPPED_FILE" ]; then
+		skipped=$(cat "$SKIPPED_FILE")
+	fi
+
+	if [ "$rc" -eq 0 ]; then
+		text=""
+		if [ -n "$summary" ]; then
+			text="Installed:"
+			while IFS= read -r app; do
+				[ -n "$app" ] && text+=$'\n'"  • $app"
+			done <<<"$summary"
+		fi
+		if [ -n "$skipped" ]; then
+			[ -n "$text" ] && text+=$'\n\n'
+			text+="Skipped:"
+			while IFS= read -r app; do
+				[ -n "$app" ] && text+=$'\n'"  • $app"
+			done <<<"$skipped"
+		fi
+		[ -n "$text" ] || text="Nothing was installed."
+		[ "$DRY_RUN" -eq 1 ] && text="Dry run complete. Nothing was changed."
+		notify-send -i system-software-install "$title" "$text" 2>/dev/null || true
+		zenity --info --no-markup --title="$title" --text="$text" --width=480 2>/dev/null || true
+	else
+		details=$(tail -n 150 "$LOG_FILE" 2>/dev/null || true)
+		notify-send -u critical -i dialog-error "boxinstall" "Installation failed. See the log." 2>/dev/null || true
+		zenity --error --no-markup --title="Installation failed" \
+			--text="The installation failed.$([ -n "$summary" ] && printf '\n\nInstalled so far:\n%s' "$summary")" \
+			--details="$details" --width=620 2>/dev/null || true
+	fi
+	return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Detection
+# ---------------------------------------------------------------------------
+is_url() {
+	case "$1" in
+	http://* | https://*) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+detect_kind() {
+	local file=$1 lower mime
+	lower="${file,,}"
+	case "$lower" in
+	*.rpm) echo rpm; return 0 ;;
+	*.deb) echo deb; return 0 ;;
+	*.appimage) echo appimage; return 0 ;;
+	*.flatpakref) echo flatpakref; return 0 ;;
+	*.flatpak) echo flatpak; return 0 ;;
+	*.snap) echo snap; return 0 ;;
+	*.run) echo run; return 0 ;;
+	esac
+
+	if command -v xdg-mime >/dev/null 2>&1; then
+		mime=$(xdg-mime query filetype "$file" 2>/dev/null || true)
+		case "$mime" in
+		application/x-rpm) echo rpm; return 0 ;;
+		application/vnd.debian.binary-package | application/x-deb) echo deb; return 0 ;;
+		application/vnd.appimage | application/x-iso9660-appimage) echo appimage; return 0 ;;
+		application/vnd.flatpak.ref) echo flatpakref; return 0 ;;
+		application/vnd.flatpak) echo flatpak; return 0 ;;
+		esac
+	fi
+	echo unknown
+}
+
+slugify() {
+	printf '%s' "$1" |
+		tr '[:upper:]' '[:lower:]' |
+		sed -E 's/[^a-z0-9]+/_/g; s/^_+//; s/_+$//'
+}
+
+kind_label() {
+	case "$1" in
+	rpm) printf 'RPM' ;;
+	deb) printf 'DEB' ;;
+	appimage) printf 'AppImage' ;;
+	flatpakref) printf 'Flatpak reference' ;;
+	flatpak) printf 'Flatpak' ;;
+	*) printf '%s' "$1" ;;
+	esac
+}
+
+# ---------------------------------------------------------------------------
+# Distrobox handling
+# ---------------------------------------------------------------------------
+list_containers() {
+	distrobox list --no-color 2>/dev/null |
+		awk -F'|' 'NR > 1 {
+			name=$2; image=$4;
+			gsub(/^[ \t]+|[ \t]+$/, "", name);
+			gsub(/^[ \t]+|[ \t]+$/, "", image);
+			if (name != "") print name "\t" image;
+		}'
+}
+
+container_exists() {
+	local name=$1
+	list_containers | awk -F'\t' -v n="$name" '$1 == n { found=1 } END { exit !found }'
+}
+
+resolve_box() {
+	local kind=$1 fallback name image lower_image
+	case "$kind" in
+	rpm) fallback="boxinstall-fedora" ;;
+	deb) fallback="boxinstall-deb" ;;
+	*) fallback="boxinstall" ;;
+	esac
+
+	if [ -n "$BOX_OVERRIDE" ]; then
+		printf '%s\n' "$BOX_OVERRIDE"
+		return 0
+	fi
+	if container_exists "$fallback"; then
+		printf '%s\n' "$fallback"
+		return 0
+	fi
+	while IFS=$'\t' read -r name image; do
+		[ -n "$name" ] || continue
+		lower_image="${image,,}"
+		case "$kind" in
+		rpm)
+			case "$lower_image" in
+			*fedora* | *rhel* | *centos* | *alma* | *rocky* | *oracle*) printf '%s\n' "$name"; return 0 ;;
+			esac
+			;;
+		deb)
+			case "$lower_image" in
+			*ubuntu* | *debian* | *mint* | *pop* | *kali*) printf '%s\n' "$name"; return 0 ;;
+			esac
+			;;
+		esac
+	done < <(list_containers)
+	printf '%s\n' "$fallback"
+}
+
+ensure_container() {
+	local kind=$1 box image
+	box=$(resolve_box "$kind")
+	if container_exists "$box"; then
+		printf '%s\n' "$box"
+		return 0
+	fi
+
+	case "$kind" in
+	rpm) image="$RPM_IMAGE" ;;
+	deb) image="$DEB_IMAGE" ;;
+	*) die "unknown container kind: $kind" ;;
+	esac
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		say "Would create distrobox '$box' from $image" >&2
+		printf '%s\n' "$box"
+		return 0
+	fi
+
+	say "Creating distrobox '$box' from $image (first run only; this can take a while)..." >&2
+	if ! run distrobox create --name "$box" --image "$image" --yes --no-entry >&2; then
+		error "could not create distrobox '$box'"
+		return 1
+	fi
+	if ! container_exists "$box"; then
+		error "distrobox '$box' was not created"
+		return 1
+	fi
+	printf '%s\n' "$box"
+}
+
+desktop_snapshot() {
+	local box=$1
+	distrobox enter "$box" -- bash -c \
+		'find /usr/share/applications /usr/local/share/applications \( -type f -o -type l \) -name "*.desktop" 2>/dev/null' \
+		2>>"$LOG_FILE" | sort -u
+}
+
+# ---------------------------------------------------------------------------
+# Shortcuts and exports
+# ---------------------------------------------------------------------------
+create_desktop_shortcut() {
+	local src=$1 dest
+	[ "$NO_DESKTOP" -eq 1 ] && return 0
+	[ "$DRY_RUN" -eq 1 ] && return 0
+	[ -f "$src" ] || return 1
+	mkdir -p "$DESKTOP_DIR"
+	dest="$DESKTOP_DIR/$(basename "$src")"
+	if cp -f -- "$src" "$dest"; then
+		chmod 0755 "$dest" 2>/dev/null || true
+		gio set "$dest" metadata::trusted true 2>/dev/null || true
+		log "DESKTOP SHORTCUT: $dest"
+	else
+		warn "could not copy launcher to $DESKTOP_DIR"
+		return 1
+	fi
+}
+
+export_desktop_entries() {
+	local box=$1 listfile=$2 entry content name out count=0
+	local -A seen=()
+	EXPORTED_COUNT=0
+
+	while IFS= read -r entry <&3; do
+		[ -n "$entry" ] || continue
+		content=$(distrobox enter "$box" -- cat "$entry" 2>>"$LOG_FILE" </dev/null) || {
+			warn "could not read $entry in '$box'"
+			continue
+		}
+		if grep -qE '^(NoDisplay|Hidden)=true' <<<"$content"; then
+			continue
+		fi
+		name=$(sed -n 's/^Name=//p' <<<"$content" | head -n1)
+		[ -n "$name" ] || name=$(basename "$entry" .desktop)
+		if [ -n "${seen[$name]:-}" ]; then
+			continue
+		fi
+		seen[$name]=1
+
+		say "Exporting launcher: $name"
+		if ! run distrobox enter "$box" -- distrobox-export --app "$entry" --export-label none </dev/null; then
+			warn "could not export launcher: $name"
+			continue
+		fi
+		out="$APPS_DIR/${box}-$(basename "$entry")"
+		if [ ! -f "$out" ]; then
+			warn "exported launcher was not found: $out"
+			continue
+		fi
+		# distrobox-export can write an invalid StartupWMClass (the .desktop path).
+		sed -i '\|^StartupWMClass=/|d' "$out" 2>/dev/null || true
+		create_desktop_shortcut "$out" || warn "could not add $name to the desktop"
+		summary_add "$name"
+		count=$((count + 1))
+	done 3<"$listfile"
+
+	refresh_desktop_db
+	EXPORTED_COUNT=$count
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# RPM
+# ---------------------------------------------------------------------------
+install_rpm() {
+	local src=$1 box staged pkgname arch before after tmp candidates
+	local installed newver relation dnf_action
+	require_cmd distrobox
+	require_cmd rpm
+	require_cmd podman
+	DUPLICATE_RELATION=""
+
+	box=$(ensure_container rpm) || return 1
+	arch=$(rpm -qp --qf '%{ARCH}' "$src" 2>/dev/null || true)
+	if [ "$arch" = "src" ] || [ "$arch" = "nosrc" ]; then
+		error "source RPMs cannot be installed: $(basename "$src")"
+		return 1
+	fi
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		say "Would install $(basename "$src") into distrobox '$box' with dnf"
+		return 0
+	fi
+
+	if ! stage_file "$src"; then
+		return 1
+	fi
+	staged="$STAGED_FILE"
+	pkgname=$(rpm -qp --qf '%{NAME}' "$staged" 2>/dev/null | head -n1 || true)
+	newver=$(rpm -qp --qf '%{EPOCH}:%{VERSION}-%{RELEASE}' "$staged" 2>/dev/null | head -n1 || true)
+
+	installed=""
+	if [ -n "$pkgname" ]; then
+		if installed=$(distrobox enter "$box" -- rpm -q --qf '%{EPOCH}:%{VERSION}-%{RELEASE}' "$pkgname" 2>/dev/null </dev/null); then
+			:
+		else
+			installed=""
+		fi
+	fi
+	if [ -n "$installed" ]; then
+		relation=$(rpm_version_relation "$installed" "$newver")
+		if ! confirm_duplicate "${pkgname:-$(basename "$src")}" "${installed#(none):}" "${newver#(none):}" "$relation"; then
+			return 0
+		fi
+	fi
+
+	dnf_action="install"
+	case "$DUPLICATE_RELATION" in
+	same) dnf_action="reinstall" ;;
+	older) dnf_action="downgrade" ;;
+	esac
+
+	tmp=$(mktemp -d "$CACHE_DIR/rpm.XXXXXX")
+	TMP_DIRS+=("$tmp")
+	before="$tmp/before"
+	after="$tmp/after"
+	candidates="$tmp/desktops"
+
+	desktop_snapshot "$box" >"$before" || true
+	say "Installing $(basename "$src") in '$box' (dependencies may be downloaded)..."
+	if ! run distrobox enter "$box" -- sudo dnf -y "$dnf_action" "$staged" </dev/null; then
+		warn "normal install failed; retrying with GPG checks disabled for this local package"
+		if ! run distrobox enter "$box" -- sudo dnf -y --nogpgcheck "$dnf_action" "$staged" </dev/null; then
+			error "dnf could not install $(basename "$src")"
+			return 1
+		fi
+	fi
+	desktop_snapshot "$box" >"$after" || true
+
+	{
+		if [ -n "$pkgname" ]; then
+			distrobox enter "$box" -- rpm -ql "$pkgname" 2>/dev/null |
+				grep -E '^/(usr/share|usr/local/share|opt/.+/share)/applications/.+\.desktop$' || true
+		fi
+		comm -13 "$before" "$after" 2>/dev/null || true
+	} | sed '/^$/d' | sort -u >"$candidates"
+
+	export_desktop_entries "$box" "$candidates"
+	if [ "${EXPORTED_COUNT:-0}" -eq 0 ]; then
+		warn "package installed, but no graphical launcher was found"
+		summary_add "$(basename "$src" .rpm) (installed, no launcher found)"
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# DEB
+# ---------------------------------------------------------------------------
+apt_update_if_needed() {
+	local box=$1 host_stamp="$CACHE_DIR/apt-$1.stamp" need=0
+	if ! distrobox enter "$box" -- test -f /var/cache/boxinstall-apt.stamp 2>/dev/null; then
+		need=1
+	fi
+	if [ "$need" -eq 0 ] && { [ ! -f "$host_stamp" ] || [ -n "$(find "$host_stamp" -mmin +1440 2>/dev/null)" ]; }; then
+		need=1
+	fi
+	if [ "$need" -eq 1 ]; then
+		say "Refreshing package lists in '$box'..."
+		if ! run distrobox enter "$box" -- sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
+			warn "apt-get update failed; trying the install anyway"
+		else
+			touch "$host_stamp" 2>/dev/null || true
+			distrobox enter "$box" -- sudo touch /var/cache/boxinstall-apt.stamp >>"$LOG_FILE" 2>&1 || true
+		fi
+	fi
+}
+
+install_deb() {
+	local src=$1 box staged pkgname before after tmp candidates
+	local installed newver relation
+	require_cmd distrobox
+	require_cmd podman
+	DUPLICATE_RELATION=""
+
+	box=$(ensure_container deb) || return 1
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		say "Would install $(basename "$src") into distrobox '$box' with apt"
+		return 0
+	fi
+
+	if ! stage_file "$src"; then
+		return 1
+	fi
+	staged="$STAGED_FILE"
+	pkgname=$(distrobox enter "$box" -- dpkg-deb -f "$staged" Package 2>/dev/null | head -n1 || true)
+	newver=$(distrobox enter "$box" -- dpkg-deb -f "$staged" Version 2>/dev/null | head -n1 || true)
+
+	installed=""
+	if [ -n "$pkgname" ]; then
+		if installed=$(distrobox enter "$box" -- dpkg-query -W -f="\${Version}" "$pkgname" 2>/dev/null </dev/null); then
+			:
+		else
+			installed=""
+		fi
+	fi
+	if [ -n "$installed" ]; then
+		relation=$(deb_version_relation "$box" "$installed" "$newver")
+		if ! confirm_duplicate "${pkgname:-$(basename "$src")}" "$installed" "$newver" "$relation"; then
+			return 0
+		fi
+	fi
+
+	tmp=$(mktemp -d "$CACHE_DIR/deb.XXXXXX")
+	TMP_DIRS+=("$tmp")
+	before="$tmp/before"
+	after="$tmp/after"
+	candidates="$tmp/desktops"
+
+	desktop_snapshot "$box" >"$before" || true
+	apt_update_if_needed "$box"
+
+	local -a apt_opts=()
+	case "$DUPLICATE_RELATION" in
+	same) apt_opts=(--reinstall) ;;
+	older) apt_opts=(--allow-downgrades) ;;
+	esac
+
+	say "Installing $(basename "$src") in '$box' (dependencies may be downloaded)..."
+	if ! run distrobox enter "$box" -- sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${apt_opts[@]}" "$staged" </dev/null; then
+		error "apt could not install $(basename "$src")"
+		return 1
+	fi
+	desktop_snapshot "$box" >"$after" || true
+
+	{
+		if [ -n "$pkgname" ]; then
+			distrobox enter "$box" -- dpkg -L "$pkgname" 2>/dev/null |
+				grep -E '^/(usr/share|usr/local/share|opt/.+/share)/applications/.+\.desktop$' || true
+		fi
+		comm -13 "$before" "$after" 2>/dev/null || true
+	} | sed '/^$/d' | sort -u >"$candidates"
+
+	export_desktop_entries "$box" "$candidates"
+	if [ "${EXPORTED_COUNT:-0}" -eq 0 ]; then
+		warn "package installed, but no graphical launcher was found"
+		summary_add "$(basename "$src" .deb) (installed, no launcher found)"
+	fi
+}
+
+stage_file() {
+	local src=$1 dir
+	dir=$(mktemp -d "$CACHE_DIR/pkg.XXXXXX")
+	TMP_DIRS+=("$dir")
+	cp -fL -- "$src" "$dir/" || return 1
+	STAGED_FILE="$dir/$(basename "$src")"
+}
+
+# ---------------------------------------------------------------------------
+# AppImage
+# ---------------------------------------------------------------------------
+install_appimage() {
+	local src=$1 base name slug destdir dest tmp dfile="" d_name="" d_comment=""
+	local d_categories="" d_mime="" d_wmclass="" d_version="" icon_ref="application-x-executable"
+	local icon_dest="" di="" target="" icon_name="" desktop exec_path
+	local old_sha="" new_sha="" relation="" old_desc="" new_desc=""
+	DUPLICATE_RELATION=""
+
+	base=$(basename -- "$src")
+	name="${base%.AppImage}"
+	name="${name%.appimage}"
+	name="${name%.APPIMAGE}"
+	slug=$(slugify "$name")
+	[ -n "$slug" ] || slug="appimage_$(date +%s)"
+	destdir="$APPIMAGE_DIR"
+	dest="$destdir/$slug.appimage"
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		say "Would install $(basename "$src") as $dest and create $APPS_DIR/$slug.desktop"
+		return 0
+	fi
+
+	if [ -e "$dest" ]; then
+		old_sha=$(sha256sum "$dest" 2>/dev/null | cut -d' ' -f1 || true)
+		new_sha=$(sha256sum "$src" 2>/dev/null | cut -d' ' -f1 || true)
+		if [ -n "$old_sha" ] && [ "$old_sha" = "$new_sha" ]; then
+			relation="same"
+		else
+			relation="different"
+		fi
+		old_desc="$(basename "$dest") ($(human_size "$(stat -c %s "$dest" 2>/dev/null || echo 0)"), $(date -r "$dest" '+%Y-%m-%d %H:%M' 2>/dev/null || true))"
+		new_desc="$(basename "$src") ($(human_size "$(stat -c %s "$src" 2>/dev/null || echo 0)"), $(date -r "$src" '+%Y-%m-%d %H:%M' 2>/dev/null || true))"
+		if ! confirm_duplicate "$name" "$old_desc" "$new_desc" "$relation"; then
+			return 0
+		fi
+	fi
+
+	mkdir -p "$destdir" "$destdir/.icons"
+	say "Installing AppImage: $(basename "$src")"
+	if ! install -m 0755 -- "$src" "$dest"; then
+		error "could not copy AppImage to $dest"
+		return 1
+	fi
+
+	tmp=$(mktemp -d "$CACHE_DIR/appimage.XXXXXX")
+	TMP_DIRS+=("$tmp")
+
+	# Pull the embedded .desktop file (if there is one).
+	if (cd "$tmp" && "$dest" --appimage-extract '*.desktop' >/dev/null 2>&1); then
+		dfile=$(find "$tmp/squashfs-root" -type f -name '*.desktop' 2>/dev/null | head -n1 || true)
+	fi
+	if [ -n "$dfile" ]; then
+		d_name=$(sed -n 's/^Name=//p' "$dfile" | head -n1 || true)
+		d_comment=$(sed -n 's/^Comment=//p' "$dfile" | head -n1 || true)
+		d_categories=$(sed -n 's/^Categories=//p' "$dfile" | head -n1 || true)
+		d_mime=$(sed -n 's/^MimeType=//p' "$dfile" | head -n1 || true)
+		d_wmclass=$(sed -n 's/^StartupWMClass=//p' "$dfile" | head -n1 || true)
+		d_version=$(sed -n 's/^X-AppImage-Version=//p' "$dfile" | head -n1 || true)
+	fi
+
+	# Pull the embedded icon. Most AppImages have a .DirIcon symlink.
+	if (cd "$tmp" && "$dest" --appimage-extract '.DirIcon' >/dev/null 2>&1); then
+		di="$tmp/squashfs-root/.DirIcon"
+		if [ -L "$di" ]; then
+			target=$(readlink "$di" 2>/dev/null || true)
+			target="${target#/}"
+			if [ -n "$target" ]; then
+				(cd "$tmp" && "$dest" --appimage-extract "$target" >/dev/null 2>&1) || true
+				di="$tmp/squashfs-root/$target"
+			fi
+		fi
+		if [ -f "$di" ]; then
+			case "$(file -b --mime-type "$di" 2>/dev/null || true)" in
+			image/svg+xml) icon_dest="$destdir/.icons/$slug.svg" ;;
+			*) icon_dest="$destdir/.icons/$slug" ;;
+			esac
+			if cp -f -- "$di" "$icon_dest"; then
+				icon_ref="$icon_dest"
+			fi
+		fi
+	fi
+
+	# Fallback: try to find the icon named in the desktop file.
+	if [ "$icon_ref" = "application-x-executable" ] && [ -n "$dfile" ]; then
+		icon_name=$(sed -n 's/^Icon=//p' "$dfile" | head -n1 || true)
+		if [ -n "$icon_name" ] && [ "${icon_name#/}" = "$icon_name" ]; then
+			(cd "$tmp" && "$dest" --appimage-extract "*${icon_name}*" >/dev/null 2>&1) || true
+			di=$(find "$tmp/squashfs-root" \( -name "${icon_name}.png" -o -name "${icon_name}.svg" -o -name "${icon_name}.xpm" \) 2>/dev/null | head -n1 || true)
+			[ -n "$di" ] || di=$(find "$tmp/squashfs-root" -iname "*${icon_name}*" -type f 2>/dev/null | head -n1 || true)
+			if [ -n "$di" ] && [ -f "$di" ]; then
+				icon_dest="$destdir/.icons/$slug"
+				if cp -f -- "$di" "$icon_dest"; then
+					icon_ref="$icon_dest"
+				fi
+			fi
+		fi
+	fi
+
+	name="${d_name:-$name}"
+	exec_path=$(printf '%s' "$dest" | sed 's/\\/\\\\/g; s/"/\\"/g')
+	desktop="$APPS_DIR/$slug.desktop"
+
+	{
+		printf '[Desktop Entry]\n'
+		printf 'Type=Application\n'
+		printf 'Version=1.0\n'
+		printf 'Name=%s\n' "$name"
+		[ -n "$d_comment" ] && printf 'Comment=%s\n' "$d_comment"
+		printf 'Exec=env DESKTOPINTEGRATION=1 "%s" %%U\n' "$exec_path"
+		printf 'TryExec=%s\n' "$dest"
+		printf 'Icon=%s\n' "$icon_ref"
+		printf 'Terminal=false\n'
+		printf 'Categories=%s\n' "${d_categories:-Utility;}"
+		printf 'StartupNotify=true\n'
+		printf 'X-AppImage-Name=%s\n' "$name"
+		[ -n "$d_mime" ] && printf 'MimeType=%s\n' "$d_mime"
+		[ -n "$d_wmclass" ] && printf 'StartupWMClass=%s\n' "$d_wmclass"
+		[ -n "$d_version" ] && printf 'X-AppImage-Version=%s\n' "$d_version"
+	} >"$desktop"
+
+	chmod 0644 "$desktop" 2>/dev/null || true
+	if command -v desktop-file-validate >/dev/null 2>&1; then
+		desktop-file-validate "$desktop" >>"$LOG_FILE" 2>&1 || true
+	fi
+
+	say "Creating launcher: $name"
+	create_desktop_shortcut "$desktop" || warn "could not add $name to the desktop"
+	summary_add "$name"
+	refresh_desktop_db
+}
+
+# ---------------------------------------------------------------------------
+# Flatpak
+# ---------------------------------------------------------------------------
+find_flatpak_desktop() {
+	local id=$1 dir f
+	for dir in \
+		"$XDG_DATA_HOME/flatpak/exports/share/applications" \
+		"/var/lib/flatpak/exports/share/applications"; do
+		[ -d "$dir" ] || continue
+		if [ -f "$dir/$id.desktop" ]; then
+			printf '%s\n' "$dir/$id.desktop"
+			return 0
+		fi
+		f=$(grep -l -x -F "X-Flatpak=$id" "$dir"/*.desktop 2>/dev/null | head -n1 || true)
+		if [ -n "$f" ]; then
+			printf '%s\n' "$f"
+			return 0
+		fi
+	done
+	return 1
+}
+
+install_flatpak() {
+	local src=$1 kind=$2 tmp before after new_ids id dfile name hint="" count=0
+	local installed_ver="" relation=""
+	require_cmd flatpak
+	require_cmd sudo
+	DUPLICATE_RELATION=""
+
+	tmp=$(mktemp -d "$CACHE_DIR/flatpak.XXXXXX")
+	TMP_DIRS+=("$tmp")
+	before="$tmp/before"
+	after="$tmp/after"
+
+	if [ "$kind" = "flatpakref" ]; then
+		hint=$(sed -n 's/^Name=//p' "$src" | head -n1 || true)
+	fi
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		say "Would install $(basename "$src") with flatpak (system scope)"
+		return 0
+	fi
+
+	flatpak list --app --columns=application 2>>"$LOG_FILE" | sort -u >"$before"
+
+	if [ -n "$hint" ] && flatpak list --app --columns=application 2>/dev/null | grep -qx "$hint"; then
+		installed_ver=$(flatpak info "$hint" 2>/dev/null | awk -F': ' '/^ *Version:/{print $2; exit}' || true)
+		if ! confirm_duplicate "$hint" "$installed_ver" "(latest from repository)" "installed"; then
+			return 0
+		fi
+		say "Updating/reinstalling Flatpak: $hint"
+	fi
+
+	say "Installing Flatpak: $(basename "$src")"
+	local flatpak_ok=0 install_out="$tmp/flatpak.out" user_out="$tmp/flatpak-user.out"
+	if sudo -n true 2>/dev/null; then
+		if run_capture "$install_out" sudo -n flatpak install --system --noninteractive -y --or-update "$src"; then
+			flatpak_ok=1
+		fi
+	else
+		if run_capture "$install_out" flatpak install --system --noninteractive -y --or-update "$src"; then
+			flatpak_ok=1
+		fi
+	fi
+	if [ "$flatpak_ok" -eq 0 ] && grep -q "already installed" "$install_out" 2>/dev/null; then
+		flatpak_ok=1
+	fi
+	if [ "$flatpak_ok" -eq 0 ]; then
+		warn "system install failed; trying user scope"
+		if run_capture "$user_out" flatpak install --user --noninteractive -y --or-update "$src"; then
+			flatpak_ok=1
+		fi
+		if [ "$flatpak_ok" -eq 0 ] && grep -q "already installed" "$user_out" 2>/dev/null; then
+			flatpak_ok=1
+		fi
+	fi
+	if [ "$flatpak_ok" -eq 0 ]; then
+		error "flatpak could not install $(basename "$src")"
+		return 1
+	fi
+
+	flatpak list --app --columns=application 2>>"$LOG_FILE" | sort -u >"$after"
+	new_ids=$(comm -13 "$before" "$after" 2>/dev/null || true)
+	if [ -z "$new_ids" ] && [ -n "$hint" ]; then
+		new_ids="$hint"
+	fi
+	if [ -z "$new_ids" ]; then
+		new_ids=$(grep -hoE 'app/[A-Za-z0-9._-]+/' "$install_out" "$user_out" 2>/dev/null |
+			head -n1 | cut -d/ -f2 || true)
+	fi
+	if [ -z "$new_ids" ]; then
+		warn "flatpak reports success, but no new application ID was detected"
+		return 0
+	fi
+
+	while IFS= read -r id <&3; do
+		[ -n "$id" ] || continue
+		dfile=$(find_flatpak_desktop "$id" || true)
+		if [ -z "$dfile" ]; then
+			warn "no desktop file found for Flatpak $id"
+			continue
+		fi
+		name=$(sed -n 's/^Name=//p' "$dfile" | head -n1 || true)
+		[ -n "$name" ] || name="$id"
+		say "Creating launcher: $name"
+		create_desktop_shortcut "$dfile" || warn "could not add $name to the desktop"
+		summary_add "$name"
+		count=$((count + 1))
+	done 3<<<"$new_ids"
+
+	refresh_desktop_db
+	if [ "$count" -eq 0 ]; then
+		warn "Flatpak installed, but no launcher was added"
+		summary_add "$(basename "$src") (installed, no launcher found)"
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# Download and dispatch
+# ---------------------------------------------------------------------------
+download_url() {
+	local url=$1 dir=$2 name dest
+	name=$(basename "${url%%\?*}")
+	[ -n "$name" ] && [ "$name" != "/" ] || name="download"
+	dest="$dir/$name"
+	say "Downloading $url" >&2
+	if ! run curl -fL --retry 3 --connect-timeout 20 --progress-bar -o "$dest" "$url" >&2; then
+		error "download failed: $url"
+		return 1
+	fi
+	printf '%s\n' "$dest"
+}
+
+install_target() {
+	local src=$1 workdir kind
+	if is_url "$src"; then
+		workdir=$(mktemp -d "$CACHE_DIR/download.XXXXXX")
+		TMP_DIRS+=("$workdir")
+		src=$(download_url "$src" "$workdir") || return 1
+	fi
+
+	if [ ! -e "$src" ]; then
+		error "file not found: $src"
+		return 1
+	fi
+	if [ ! -f "$src" ]; then
+		error "not a regular file: $src"
+		return 1
+	fi
+
+	kind=$(detect_kind "$src")
+	case "$kind" in
+	rpm | deb | appimage | flatpakref | flatpak)
+		say "Detected $(kind_label "$kind") package: $(basename "$src")"
+		;;
+	snap)
+		error "Snap packages are not supported on Bazzite. Use the Flatpak or AppImage version instead."
+		return 1
+		;;
+	run)
+		error "self-extracting .run installers are not supported. Use the distribution's RPM/DEB or an AppImage instead."
+		return 1
+		;;
+	*)
+		error "unsupported package type: $(basename "$src")"
+		error "supported: .rpm, .deb, .AppImage, .flatpakref, .flatpak"
+		return 1
+		;;
+	esac
+
+	case "$kind" in
+	rpm) install_rpm "$src" ;;
+	deb) install_deb "$src" ;;
+	appimage) install_appimage "$src" ;;
+	flatpakref | flatpak) install_flatpak "$src" "$kind" ;;
+	esac
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+	FILES=()
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-h | --help)
+			usage
+			exit 0
+			;;
+		-V | --version)
+			printf '%s %s\n' "$PROG" "$VERSION"
+			exit 0
+			;;
+		--pick)
+			PICK=1
+			;;
+		--no-gui)
+			NO_GUI=1
+			;;
+		--no-desktop)
+			NO_DESKTOP=1
+			;;
+		--reinstall | -y | --yes)
+			REINSTALL=1
+			;;
+		--no-wait)
+			WAIT_TIMEOUT=0
+			;;
+		--wait)
+			[ $# -ge 2 ] || die "--wait needs a number of seconds"
+			WAIT_TIMEOUT="$2"
+			shift
+			;;
+		--wait=*)
+			WAIT_TIMEOUT="${1#*=}"
+			;;
+		--dry-run)
+			DRY_RUN=1
+			;;
+		-v | --verbose)
+			VERBOSE=1
+			;;
+		--box)
+			[ $# -ge 2 ] || die "--box needs a container name"
+			BOX_OVERRIDE="$2"
+			shift
+			;;
+		--box=*)
+			BOX_OVERRIDE="${1#*=}"
+			;;
+		--)
+			shift
+			while [ $# -gt 0 ]; do
+				FILES+=("$1")
+				shift
+			done
+			break
+			;;
+		-*)
+			die "unknown option: $1 (try --help)"
+			;;
+		*)
+			FILES+=("$1")
+			;;
+		esac
+		shift
+	done
+
+	case "$WAIT_TIMEOUT" in
+	'' | *[!0-9]*) die "invalid wait timeout: $WAIT_TIMEOUT" ;;
+	esac
+
+	mkdir -p "$STATE_DIR" "$CACHE_DIR" "$APPS_DIR" 2>/dev/null || true
+	if ! touch "$LOG_FILE" 2>/dev/null; then
+		LOG_FILE="/dev/null"
+	fi
+
+	if [ "${BOXINSTALL_GUI_CHILD:-0}" = "1" ]; then
+		MODE="gui-child"
+		GUI_CHILD=1
+	fi
+
+	# If --pick was requested from a terminal, force the graphical picker.
+	if [ "$PICK" -eq 1 ] && [ "$GUI_CHILD" -eq 0 ]; then
+		if gui_available || { [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] && command -v zenity >/dev/null 2>&1; }; then
+			launch_gui "$@"
+			exit $?
+		fi
+		die "--pick needs a graphical session with zenity"
+	fi
+
+	if gui_available && [ "$GUI_CHILD" -eq 0 ]; then
+		launch_gui "$@"
+		exit $?
+	fi
+
+	if [ ${#FILES[@]} -eq 0 ]; then
+		usage >&2
+		exit 2
+	fi
+
+	acquire_lock
+	: >"$SUMMARY_FILE" 2>/dev/null || true
+	: >"$SKIPPED_FILE" 2>/dev/null || true
+
+	local failures=0 total=0 file
+	for file in "${FILES[@]}"; do
+		total=$((total + 1))
+		if ! install_target "$file"; then
+			failures=$((failures + 1))
+		fi
+	done
+
+	if [ "$MODE" != "gui-child" ]; then
+		if [ -s "$SUMMARY_FILE" ]; then
+			printf '\n%sInstalled applications:%s\n' "$C_BOLD" "$C_RESET"
+			sed 's/^/  - /' "$SUMMARY_FILE"
+		fi
+		if [ -s "$SKIPPED_FILE" ]; then
+			printf '\n%sSkipped:%s\n' "$C_YELLOW" "$C_RESET"
+			sed 's/^/  - /' "$SKIPPED_FILE"
+		fi
+		if [ ! -s "$SUMMARY_FILE" ] && [ -s "$SKIPPED_FILE" ]; then
+			printf '\nNothing was installed.\n'
+		fi
+		if [ "$DRY_RUN" -eq 1 ]; then
+			printf '\nDry run complete; nothing was changed.\n'
+		elif [ "$failures" -eq 0 ]; then
+			printf '\n%sDone.%s\n' "$C_GREEN" "$C_RESET"
+		else
+			printf '\n%s%d of %d package(s) failed.%s See %s\n' "$C_RED" "$failures" "$total" "$C_RESET" "$LOG_FILE"
+		fi
+	fi
+
+	[ "$failures" -eq 0 ] || exit 1
+}
+
+main "$@"

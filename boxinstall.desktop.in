@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Install Linux App
+GenericName=Package Installer
+Comment=Install RPM, DEB, AppImage, and Flatpak packages in a distrobox
+Exec=@BIN@ %F
+TryExec=@BIN@
+Icon=system-software-install
+Terminal=false
+StartupNotify=true
+Categories=Settings;PackageManager;
+Keywords=install;package;rpm;deb;appimage;flatpak;distrobox;
+MimeType=application/x-rpm;application/vnd.debian.binary-package;application/x-deb;application/vnd.appimage;application/x-iso9660-appimage;application/vnd.flatpak.ref;application/vnd.flatpak;
+Actions=PickFile;
+
+[Desktop Action PickFile]
+Name=Choose a package…
+Exec=@BIN@ --pick
