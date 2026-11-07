@@ -137,20 +137,21 @@ Open **Manage Installed Apps** from the app grid, or run:
 boxinstall manage
 ```
 
-The manager discovers:
+The manager is a GTK4/Libadwaita app (with a Zenity fallback if GTK bindings are unavailable). It discovers:
 
 - apps exported from your distroboxes (RPM/DEB packages),
 - AppImages in `~/AppImages/`,
 - Flatpaks installed on the system.
 
-For each app it shows the name, version, type, container, and size. Actions are:
+The list shows each app's icon (or a generic gear icon when no icon is found), name, version, type, container, and size. Features:
 
-- **Details** – package/container/desktop paths and size;
-- **Launch** – start the app;
-- **Update / Reinstall** – `dnf upgrade`, `apt-get --only-upgrade`, or `flatpak update`; AppImages open a file picker for a replacement;
-- **Remove** – uninstall the package/Flatpak/AppImage and clean up its desktop launcher.
+- **Side panel** — selecting one app shows its icon, version, type, container, size, locations, and **Launch / Update / Remove** quick actions without opening another window.
+- **Bulk actions** — Ctrl/Shift-click or use **Select all**, then update or remove the selected apps from the side panel.
+- **Sorting** — sort by name, version, package type, container, or size, with an ascending/descending toggle.
+- **Drag and drop** — drag RPM/DEB/AppImage/Flatpak files onto the manager; a highlighted “Drop packages to install” overlay appears, and the normal install review/progress runs.
+- **Refresh/search** — refresh discovery or filter the list by name/type/container.
 
-The same operations are available non-interactively for CI:
+For AppImages, **Update** opens a file picker for the replacement AppImage. The same operations are available non-interactively for CI:
 
 ```bash
 boxinstall list                     # human-readable table
@@ -310,6 +311,7 @@ See [AGENTS.md](AGENTS.md) for the code-quality bar, testing requirements, and A
 | `~/.local/bin/boxinstall` | the command |
 | `~/.local/share/applications/boxinstall.desktop` | app-grid launcher and MIME handler |
 | `~/.local/share/applications/boxinstall-manage.desktop` | Manage Installed Apps launcher |
+| `~/.local/lib/boxinstall/manager.py` | GTK4/Libadwaita app manager |
 | `~/.local/share/bash-completion/completions/boxinstall` | bash completion |
 | `~/.local/state/boxinstall/boxinstall.log` | log |
 | `~/.local/state/boxinstall/previous-mime-defaults` | restored by `uninstall.sh` |

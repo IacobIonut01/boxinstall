@@ -16,6 +16,7 @@ jobs:
           bash -n install.sh
           bash -n uninstall.sh
           bash -n completions/boxinstall.bash
+          python3 -m py_compile manager.py
 
       - name: ShellCheck
         run: |

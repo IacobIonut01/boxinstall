@@ -86,6 +86,10 @@ if command -v desktop-file-validate >/dev/null 2>&1; then
 	desktop-file-validate "$APPS_DIR/boxinstall-manage.desktop" || true
 fi
 
+say "Installing GTK app manager"
+mkdir -p "$HOME/.local/lib/boxinstall"
+install -m 0644 "$SRC_DIR/manager.py" "$HOME/.local/lib/boxinstall/manager.py"
+
 say "Installing shell completion"
 mkdir -p "$COMPLETION_DIR"
 install -m 0644 "$SRC_DIR/completions/boxinstall.bash" "$COMPLETION_DIR/boxinstall"

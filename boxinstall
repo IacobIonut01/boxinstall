@@ -15,7 +15,7 @@
 set -Eeuo pipefail
 
 PROG="boxinstall"
-VERSION="1.1.0"
+VERSION="1.2.0"
 SELF="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "$0")"
 
 # ---------------------------------------------------------------------------
@@ -1846,7 +1846,7 @@ run_manager_action() {
 	return "$rc"
 }
 
-cmd_manage() {
+cmd_manage_zenity() {
 	command -v zenity >/dev/null 2>&1 || die "manage needs zenity"
 	[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] || die "manage needs a graphical session"
 
@@ -1968,6 +1968,17 @@ cmd_manage() {
 			esac
 		done
 	done
+}
+
+cmd_manage() {
+	local manager="${BOXINSTALL_MANAGER:-$HOME/.local/lib/boxinstall/manager.py}"
+	if [ -f "$manager" ] && command -v python3 >/dev/null 2>&1; then
+		if python3 -c 'import gi; gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1")' >/dev/null 2>&1; then
+			export XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}:$HOME/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share"
+			BOXINSTALL_BIN="$SELF" exec python3 "$manager"
+		fi
+	fi
+	cmd_manage_zenity
 }
 
 # ---------------------------------------------------------------------------

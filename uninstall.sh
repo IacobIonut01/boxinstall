@@ -61,6 +61,8 @@ rm -f "$BIN_DIR/boxinstall"
 rm -f "$APPS_DIR/boxinstall.desktop"
 rm -f "$APPS_DIR/boxinstall-manage.desktop"
 rm -f "$COMPLETION_DIR/boxinstall"
+rm -f "$HOME/.local/lib/boxinstall/manager.py"
+rmdir "$HOME/.local/lib/boxinstall" 2>/dev/null || true
 
 say "Restoring previous file associations"
 if [ -f "$MIME_DEFAULTS_FILE" ]; then
